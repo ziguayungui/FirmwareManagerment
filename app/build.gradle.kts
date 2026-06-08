@@ -29,8 +29,8 @@ android {
         }
     }
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_11
-        targetCompatibility = JavaVersion.VERSION_11
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
     buildFeatures {
         compose = true
@@ -38,6 +38,16 @@ android {
 }
 
 dependencies {
+    // ZXing 二维码扫描
+    implementation("com.google.zxing:core:3.5.2")
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+    
+    // OkHttp 网络请求
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    
+    // Material Icons
+    implementation("androidx.compose.material:material-icons-core:1.6.8")
+    implementation("androidx.compose.material:material-icons-extended:1.6.8")
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.compose.material3)
