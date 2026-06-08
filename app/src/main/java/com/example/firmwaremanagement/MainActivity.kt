@@ -60,6 +60,7 @@ import com.example.firmwaremanagement.model.TaskState
 import com.example.firmwaremanagement.model.UpdateInfo
 import com.example.firmwaremanagement.network.DownloadService
 import com.example.firmwaremanagement.network.UpdateChecker
+import com.example.firmwaremanagement.network.UpdateCheckResult
 import com.example.firmwaremanagement.scanner.ScanActivity
 import com.example.firmwaremanagement.storage.FileCleaner
 import com.example.firmwaremanagement.storage.PrefsManager
@@ -166,7 +167,7 @@ class MainActivity : ComponentActivity() {
             }
 
             when (result) {
-                is UpdateCheckResult.NoUpdate -> {
+                UpdateCheckResult.NoUpdate -> {
                     showNoUpdateDialog = true
                     stage = Stage.IDLE
                 }
@@ -177,6 +178,10 @@ class MainActivity : ComponentActivity() {
                 }
                 is UpdateCheckResult.Error -> {
                     errorMessage = result.message
+                    stage = Stage.ERROR
+                }
+                else -> {
+                    errorMessage = "未知错误"
                     stage = Stage.ERROR
                 }
             }
