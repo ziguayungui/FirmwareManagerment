@@ -10,6 +10,7 @@ import android.content.Intent
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.example.firmwaremanagement.MainActivity
 import com.example.firmwaremanagement.R
@@ -29,9 +30,12 @@ import java.util.concurrent.atomic.AtomicBoolean
 class DownloadService : Service() {
 
     companion object {
+        private const val TAG = "DownloadService"
+        
         private const val CHANNEL_ID = "download_channel"
         private const val NOTIFICATION_ID = 1
         private const val PROGRESS_SAVE_THRESHOLD = 1024 * 1024L // 1MB
+        private const val NO_DATA_TIMEOUT_MS = 30000L // 30秒无数据超时
 
         const val ACTION_START_DOWNLOAD = "com.example.firmwaremanagement.ACTION_START_DOWNLOAD"
         const val ACTION_PAUSE_DOWNLOAD = "com.example.firmwaremanagement.ACTION_PAUSE_DOWNLOAD"
@@ -41,6 +45,11 @@ class DownloadService : Service() {
         const val EXTRA_URL = "extra_url"
         const val EXTRA_TARGET_PATH = "extra_target_path"
         const val EXTRA_EXPECTED_MD5 = "extra_expected_md5"
+
+        // 广播 Action
+        const val ACTION_DOWNLOAD_ERROR = "com.example.firmwaremanagement.ACTION_DOWNLOAD_ERROR"
+        const val ACTION_DOWNLOAD_COMPLETE = "com.example.firmwaremanagement.ACTION_DOWNLOAD_COMPLETE"
+        const val EXTRA_ERROR_MESSAGE = "extra_error_message"
     }
 
     inner class DownloadBinder : Binder() {
@@ -69,6 +78,7 @@ class DownloadService : Service() {
 
     private var response: Response? = null
     private var inputStream: InputStream? = null
+    private var lastDataReceivedTime: Long = 0L
 
     override fun onCreate() {
         super.onCreate()
@@ -102,7 +112,11 @@ class DownloadService : Service() {
     }
 
     fun startDownload(url: String, targetPath: String, expectedMD5: String) {
-        if (isDownloading.get()) return
+        Log.d(TAG, "startDownload: url=$url, targetPath=$targetPath, expectedMD5=$expectedMD5")
+        if (isDownloading.get()) {
+            Log.w(TAG, "startDownload: already downloading, ignoring")
+            return
+        }
 
         this.currentUrl = url
         this.targetPath = targetPath
@@ -116,44 +130,59 @@ class DownloadService : Service() {
         val file = File(targetPath)
         this.tempFile = File(targetPath + ".tmp")
         tempFile?.parentFile?.mkdirs()
+        Log.d(TAG, "startDownload: tempFile=${tempFile?.absolutePath}")
 
         saveTaskState(Stage.DOWNLOADING)
 
         Thread {
+            Log.d(TAG, "startDownload: starting download thread")
             isDownloading.set(true)
             startForeground(NOTIFICATION_ID, createNotification(0, 0, 0, 0))
             executeDownload(false)
             isDownloading.set(false)
+            Log.d(TAG, "startDownload: download thread finished, isDownloading=false")
         }.start()
     }
 
     fun pauseDownload() {
+        Log.d(TAG, "pauseDownload: pausing download")
         isPaused.set(true)
         saveTaskState(Stage.IDLE)
     }
 
     fun resumeDownload() {
-        if (!isPaused.get() || currentUrl == null || targetPath == null || expectedMD5 == null) return
+        Log.d(TAG, "resumeDownload: resuming download, isPaused=${isPaused.get()}")
+        if (!isPaused.get() || currentUrl == null || targetPath == null || expectedMD5 == null) {
+            Log.w(TAG, "resumeDownload: conditions not met, ignoring")
+            return
+        }
 
         isPaused.set(false)
         saveTaskState(Stage.DOWNLOADING)
 
         Thread {
+            Log.d(TAG, "resumeDownload: starting resume thread")
             executeDownload(true)
         }.start()
     }
 
     fun cancelDownload() {
+        Log.d(TAG, "cancelDownload: cancelling download")
         isCancelled.set(true)
         isPaused.set(false)
 
         try {
+            Log.d(TAG, "cancelDownload: closing streams")
             inputStream?.close()
             response?.close()
         } catch (_: Exception) {
+            Log.e(TAG, "cancelDownload: error closing streams", )
         }
 
-        tempFile?.delete()
+        tempFile?.let {
+            Log.d(TAG, "cancelDownload: deleting temp file ${it.absolutePath}")
+            it.delete()
+        }
         TaskStateManager.clearTaskState(applicationContext)
 
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -161,46 +190,81 @@ class DownloadService : Service() {
     }
 
     private fun executeDownload(isResume: Boolean) {
+        Log.d(TAG, "executeDownload: start, isResume=$isResume, downloadedBytes=$downloadedBytes")
+        lastDataReceivedTime = System.currentTimeMillis()
+        
         try {
             val requestBuilder = Request.Builder().url(currentUrl!!)
+            Log.d(TAG, "executeDownload: requesting URL: ${currentUrl}")
 
             if (isResume && downloadedBytes > 0) {
                 requestBuilder.addHeader("Range", "bytes=$downloadedBytes-")
+                Log.d(TAG, "executeDownload: resume from byte $downloadedBytes")
             }
 
+            Log.d(TAG, "executeDownload: executing HTTP request...")
             response = client.newCall(requestBuilder.build()).execute()
+            Log.d(TAG, "executeDownload: response received, code=${response!!.code}, isSuccessful=${response!!.isSuccessful}")
 
             if (!response!!.isSuccessful && response!!.code != 206) {
+                Log.e(TAG, "executeDownload: HTTP request failed, code=${response!!.code}")
                 onDownloadError("Download failed: ${response!!.code}")
+                return
+            }
+
+            // 检查内容类型，防止下载HTML错误页面
+            val contentType = response!!.body?.contentType()?.toString() ?: ""
+            Log.d(TAG, "executeDownload: contentType=$contentType")
+            if (contentType.contains("text/html", ignoreCase = true)) {
+                Log.e(TAG, "executeDownload: server returned HTML, not a valid file")
+                onDownloadError("Server returned HTML error page (${response!!.code})")
                 return
             }
 
             if (!isResume) {
                 totalBytes = response!!.body?.contentLength() ?: 0L
+                Log.d(TAG, "executeDownload: totalBytes=$totalBytes (from Content-Length)")
             } else {
                 val contentRange = response!!.header("Content-Range")
+                Log.d(TAG, "executeDownload: Content-Range header: $contentRange")
                 if (contentRange != null) {
                     val totalPart = contentRange.substringAfter("/")
                     if (totalPart != "*") {
                         totalBytes = totalPart.toLongOrNull() ?: totalBytes
+                        Log.d(TAG, "executeDownload: totalBytes=$totalBytes (from Content-Range)")
                     }
                 }
             }
 
             inputStream = response!!.body?.byteStream()
+            Log.d(TAG, "executeDownload: inputStream obtained")
 
             if (inputStream == null) {
+                Log.e(TAG, "executeDownload: inputStream is null")
                 onDownloadError("Failed to get input stream")
                 return
             }
 
             val buffer = ByteArray(8192)
-            var bytesRead: Int
+            var bytesRead: Int = 0
             var lastProgressUpdate = 0L
+            var hasStartedReceivingData = false
+            var totalReadBytes = 0L
 
+            Log.d(TAG, "executeDownload: starting to read data, tempFile=${tempFile?.absolutePath}")
             FileOutputStream(tempFile, isResume).use { outputStream ->
-                while (inputStream!!.read(buffer).also { bytesRead = it } != -1) {
+                while (true) {
+                    // 检查无数据超时
+                    val now = System.currentTimeMillis()
+                    if (hasStartedReceivingData && now - lastDataReceivedTime > NO_DATA_TIMEOUT_MS) {
+                        Log.e(TAG, "executeDownload: timeout, no data for ${NO_DATA_TIMEOUT_MS / 1000}s, lastDataReceivedTime=$lastDataReceivedTime")
+                        onDownloadError("Download timeout: no data received for ${NO_DATA_TIMEOUT_MS / 1000} seconds")
+                        return
+                    }
+
+                    // 检查是否被取消或暂停
                     if (isCancelled.get()) {
+                        Log.d(TAG, "executeDownload: cancelled")
                         return
                     }
 
@@ -208,33 +272,66 @@ class DownloadService : Service() {
                         Thread.sleep(100)
                     }
 
-                    if (isCancelled.get()) return
+                    if (isCancelled.get()) {
+                        Log.d(TAG, "executeDownload: cancelled after pause")
+                        return
+                    }
 
+                    // 非阻塞式读取数据，带超时检测
+                    val available = try {
+                        inputStream!!.available()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "executeDownload: available() exception: ${e.message}")
+                        0
+                    }
+
+                    if (available <= 0) {
+                        // 没有可用数据，短暂等待后继续检测
+                        Thread.sleep(100)
+                        continue
+                    }
+
+                    bytesRead = inputStream!!.read(buffer)
+                    if (bytesRead == -1) {
+                        // 流结束
+                        Log.d(TAG, "executeDownload: stream ended, totalReadBytes=$downloadedBytes")
+                        break
+                    }
+
+                    hasStartedReceivingData = true
+                    lastDataReceivedTime = System.currentTimeMillis()
                     outputStream.write(buffer, 0, bytesRead)
                     downloadedBytes += bytesRead
+                    totalReadBytes += bytesRead
 
                     if (downloadedBytes - lastSaveBytes >= PROGRESS_SAVE_THRESHOLD) {
                         saveTaskState(Stage.DOWNLOADING)
                         lastSaveBytes = downloadedBytes
                     }
 
-                    val now = System.currentTimeMillis()
                     if (now - lastProgressUpdate >= 500) {
                         val speed = calculateSpeed()
                         updateNotification(downloadedBytes, totalBytes, speed)
                         lastProgressUpdate = now
+                        Log.d(TAG, "executeDownload: progress $downloadedBytes / $totalBytes, speed=$speed B/s")
                     }
                 }
             }
 
+            Log.d(TAG, "executeDownload: closing streams, totalReadBytes=$downloadedBytes")
             inputStream?.close()
             response?.close()
 
-            if (isCancelled.get()) return
+            if (isCancelled.get()) {
+                Log.d(TAG, "executeDownload: cancelled, skipping verifyAndComplete")
+                return
+            }
 
+            Log.d(TAG, "executeDownload: calling verifyAndComplete")
             verifyAndComplete()
 
         } catch (e: Exception) {
+            Log.e(TAG, "executeDownload: exception: ${e.message}", e)
             if (!isCancelled.get()) {
                 onDownloadError(e.message ?: "Unknown error")
             }
@@ -242,39 +339,91 @@ class DownloadService : Service() {
     }
 
     private fun verifyAndComplete() {
-        val file = tempFile ?: return
-        val target = targetPath ?: return
-        val md5 = expectedMD5 ?: return
+        Log.d(TAG, "verifyAndComplete: start")
+        val file = tempFile ?: run {
+            Log.e(TAG, "verifyAndComplete: tempFile is null")
+            return
+        }
+        val target = targetPath ?: run {
+            Log.e(TAG, "verifyAndComplete: targetPath is null")
+            return
+        }
+        val md5 = expectedMD5 ?: run {
+            Log.e(TAG, "verifyAndComplete: expectedMD5 is null")
+            return
+        }
+
+        Log.d(TAG, "verifyAndComplete: file=${file.absolutePath}, length=${file.length()}, target=$target, expectedMD5=$md5")
 
         if (!file.exists() || file.length() == 0L) {
+            Log.e(TAG, "verifyAndComplete: file is empty or doesn't exist")
             onDownloadError("Downloaded file is empty")
             return
         }
 
+        // 检查文件大小，固件文件通常大于1MB
+        val minFirmwareSize = 1024 * 1024L // 1MB
+        if (file.length() < minFirmwareSize) {
+            Log.e(TAG, "verifyAndComplete: file too small (${file.length()} < $minFirmwareSize)")
+            file.delete()
+            onDownloadError("Downloaded file is too small (${file.length()} bytes), likely invalid")
+            return
+        }
+
+        Log.d(TAG, "verifyAndComplete: calculating MD5...")
         val calculatedMD5 = MD5Utils.calculateFileMD5(file)
+        Log.d(TAG, "verifyAndComplete: calculatedMD5=$calculatedMD5")
+        
         if (!calculatedMD5.equals(md5, ignoreCase = true)) {
+            Log.e(TAG, "verifyAndComplete: MD5 mismatch, expected=$md5, calculated=$calculatedMD5")
             file.delete()
             onDownloadError("MD5 verification failed")
             return
         }
+        
+        Log.d(TAG, "verifyAndComplete: MD5 verified successfully")
 
         val targetFile = File(target)
         if (targetFile.exists()) {
+            Log.d(TAG, "verifyAndComplete: deleting existing target file")
             targetFile.delete()
         }
 
+        Log.d(TAG, "verifyAndComplete: renaming temp file to target")
         if (file.renameTo(targetFile)) {
+            Log.d(TAG, "verifyAndComplete: rename successful, saving state")
             saveTaskState(Stage.DOWNLOADED)
             updateNotificationComplete()
+            
+            // 发送完成广播，通知 UI
+            val completeIntent = Intent(ACTION_DOWNLOAD_COMPLETE).apply {
+                setPackage(packageName)
+            }
+            sendBroadcast(completeIntent)
+            
+            Log.d(TAG, "verifyAndComplete: download completed successfully!")
         } else {
+            Log.e(TAG, "verifyAndComplete: rename failed")
             onDownloadError("Failed to rename temp file")
         }
     }
 
     private fun onDownloadError(errorMsg: String) {
-        tempFile?.delete()
+        Log.e(TAG, "onDownloadError: $errorMsg")
+        tempFile?.let {
+            Log.d(TAG, "onDownloadError: deleting temp file ${it.absolutePath}")
+            it.delete()
+        }
         TaskStateManager.setError(applicationContext, errorMsg)
         updateNotificationError(errorMsg)
+        
+        // 发送错误广播，通知 UI
+        val errorIntent = Intent(ACTION_DOWNLOAD_ERROR).apply {
+            putExtra(EXTRA_ERROR_MESSAGE, errorMsg)
+            setPackage(packageName)
+        }
+        sendBroadcast(errorIntent)
+        
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }

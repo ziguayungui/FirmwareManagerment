@@ -1,8 +1,10 @@
 package com.example.firmwaremanagement
 
+import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.ServiceConnection
 import android.os.Bundle
 import android.os.IBinder
@@ -66,6 +68,7 @@ import com.example.firmwaremanagement.scanner.ScanActivity
 import com.example.firmwaremanagement.storage.FileCleaner
 import com.example.firmwaremanagement.storage.PrefsManager
 import com.example.firmwaremanagement.storage.TaskStateManager
+import java.io.File
 import com.example.firmwaremanagement.ui.SettingsActivity
 import com.example.firmwaremanagement.ui.theme.FirmwareManagementTheme
 import com.example.firmwaremanagement.utils.ZipPayloadExtractor
@@ -97,6 +100,22 @@ class MainActivity : ComponentActivity() {
     private var showNewUpdateDialog by mutableStateOf(false)
     private var pendingUpdateInfo by mutableStateOf<UpdateInfo?>(null)
     private var resumeRefreshKey by mutableStateOf(0)  // 用于在onResume时刷新UI
+
+    // 下载事件广播接收器
+    private val downloadEventReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                DownloadService.ACTION_DOWNLOAD_ERROR -> {
+                    val errorMsg = intent.getStringExtra(DownloadService.EXTRA_ERROR_MESSAGE) ?: "下载失败"
+                    errorMessage = errorMsg
+                    stage = Stage.ERROR
+                }
+                DownloadService.ACTION_DOWNLOAD_COMPLETE -> {
+                    stage = Stage.DOWNLOADED
+                }
+            }
+        }
+    }
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -281,15 +300,47 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        
+        // 注册下载事件广播接收器
+        val filter = IntentFilter().apply {
+            addAction(DownloadService.ACTION_DOWNLOAD_ERROR)
+            addAction(DownloadService.ACTION_DOWNLOAD_COMPLETE)
+        }
+        registerReceiver(downloadEventReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        
+        // 加载任务状态
         val state = TaskStateManager.loadTaskState(this)
         if (state != null) {
-            stage = state.stage
+            // 检查错误状态是否仍然有效
             if (state.stage == Stage.ERROR) {
-                errorMessage = state.errorMsg
+                // 如果目标文件不存在，说明下载从未成功或文件已被清理，忽略旧错误
+                val targetFile = File(state.targetFile)
+                if (!targetFile.exists()) {
+                    // 错误状态已过期，清除并重置为IDLE
+                    TaskStateManager.clearTaskState(this)
+                    stage = Stage.IDLE
+                    errorMessage = null
+                } else {
+                    // 文件存在，显示错误状态
+                    stage = state.stage
+                    errorMessage = state.errorMsg
+                }
+            } else {
+                stage = state.stage
             }
         }
         // 刷新UI以更新服务器地址显示
         resumeRefreshKey++
+    }
+
+    override fun onPause() {
+        super.onPause()
+        // 取消注册广播接收器
+        try {
+            unregisterReceiver(downloadEventReceiver)
+        } catch (e: Exception) {
+            // receiver might not be registered
+        }
     }
 
     override fun onDestroy() {
@@ -410,7 +461,6 @@ fun MainScreen(
                 Stage.REBOOT_PENDING -> RebootPendingScreen(onReboot = onReboot)
                 Stage.ERROR -> ErrorScreen(
                     message = errorMessage ?: "未知错误",
-                    onRetry = { onStageChange(Stage.IDLE) },
                     onDismiss = { onStageChange(Stage.IDLE) }
                 )
             }
@@ -676,7 +726,6 @@ fun RebootPendingScreen(onReboot: () -> Unit) {
 @Composable
 fun ErrorScreen(
     message: String,
-    onRetry: () -> Unit,
     onDismiss: () -> Unit
 ) {
     Column(
@@ -701,20 +750,13 @@ fun ErrorScreen(
 
         Spacer(modifier = Modifier.height(32.dp))
 
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(16.dp)
+        Button(
+            onClick = onDismiss,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = TechBlue
+            )
         ) {
-            OutlinedButton(onClick = onDismiss) {
-                Text("取消", color = TechBlue)
-            }
-            Button(
-                onClick = onRetry,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = TechBlue
-                )
-            ) {
-                Text("重试")
-            }
+            Text("确定", color = WhiteText)
         }
     }
 }
