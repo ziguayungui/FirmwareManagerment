@@ -96,6 +96,7 @@ class MainActivity : ComponentActivity() {
     private var showNoUpdateDialog by mutableStateOf(false)
     private var showNewUpdateDialog by mutableStateOf(false)
     private var pendingUpdateInfo by mutableStateOf<UpdateInfo?>(null)
+    private var resumeRefreshKey by mutableStateOf(0)  // 用于在onResume时刷新UI
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -136,7 +137,8 @@ class MainActivity : ComponentActivity() {
                         pendingUpdateInfo?.let { startDownload(it) }
                     },
                     onDismissNewUpdate = { showNewUpdateDialog = false },
-                    pendingUpdateInfo = pendingUpdateInfo
+                    pendingUpdateInfo = pendingUpdateInfo,
+                    resumeRefreshKey = resumeRefreshKey
                 )
             }
         }
@@ -286,6 +288,8 @@ class MainActivity : ComponentActivity() {
                 errorMessage = state.errorMsg
             }
         }
+        // 刷新UI以更新服务器地址显示
+        resumeRefreshKey++
     }
 
     override fun onDestroy() {
@@ -320,16 +324,26 @@ fun MainScreen(
     showNewUpdateDialog: Boolean,
     onStartNewDownload: () -> Unit,
     onDismissNewUpdate: () -> Unit,
-    pendingUpdateInfo: UpdateInfo?
+    pendingUpdateInfo: UpdateInfo?,
+    resumeRefreshKey: Int = 0
 ) {
     val context = LocalContext.current
-    var serverUrl by remember { mutableStateOf(PrefsManager.getServerBaseUrl() ?: "") }
-    var currentVersion by remember { mutableStateOf(PrefsManager.getCurrentVersion()) }
+    var serverUrl by mutableStateOf(PrefsManager.getServerBaseUrl() ?: "")
+    var currentVersion by mutableStateOf(PrefsManager.getCurrentVersion())
     var progress by remember { mutableFloatStateOf(0f) }
 
-    LaunchedEffect(Unit) {
+    // 监听resumeRefreshKey变化，当从设置页面返回时更新服务器地址
+    LaunchedEffect(resumeRefreshKey) {
         serverUrl = PrefsManager.getServerBaseUrl() ?: ""
         currentVersion = PrefsManager.getCurrentVersion()
+    }
+
+    // 监听stage变化，当从设置页面返回时，stage变化会触发重组，从而更新serverUrl
+    LaunchedEffect(stage) {
+        if (stage == Stage.IDLE || stage == Stage.CHECK_PREPARE) {
+            serverUrl = PrefsManager.getServerBaseUrl() ?: ""
+            currentVersion = PrefsManager.getCurrentVersion()
+        }
     }
 
     LaunchedEffect(stage) {
