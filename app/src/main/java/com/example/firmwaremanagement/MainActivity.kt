@@ -9,10 +9,10 @@ import android.os.IBinder
 import android.os.PowerManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -22,11 +22,16 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.QrCodeScanner
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
@@ -55,7 +60,6 @@ import com.example.firmwaremanagement.model.TaskState
 import com.example.firmwaremanagement.model.UpdateInfo
 import com.example.firmwaremanagement.network.DownloadService
 import com.example.firmwaremanagement.network.UpdateChecker
-import com.example.firmwaremanagement.network.UpdateCheckResult
 import com.example.firmwaremanagement.scanner.ScanActivity
 import com.example.firmwaremanagement.storage.FileCleaner
 import com.example.firmwaremanagement.storage.PrefsManager
@@ -70,6 +74,12 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.UUID
+
+val TechBlue = Color(0xFF2196F3)
+val DarkBackground = Color(0xFF121212)
+val CardBackground = Color(0xFF1E1E1E)
+val WhiteText = Color(0xFFFFFFFF)
+val GrayText = Color(0xFFB0B0B0)
 
 class MainActivity : ComponentActivity() {
 
@@ -99,9 +109,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         PrefsManager.init(this)
-        enableEdgeToEdge()
         setContent {
-            FirmwareManagementTheme(darkTheme = true) {
+            FirmwareManagementTheme {
                 MainScreen(
                     onNavigateToScan = { navigateToScan() },
                     onNavigateToSettings = { navigateToSettings() },
@@ -149,9 +158,8 @@ class MainActivity : ComponentActivity() {
                 return@launch
             }
 
-            // Show loading state
             stage = Stage.CHECK_PREPARE
-            delay(500) // Brief delay for visual feedback
+            delay(500)
 
             val result = withContext(Dispatchers.IO) {
                 UpdateChecker.checkForUpdateWithVersion(serverUrl)
@@ -180,7 +188,6 @@ class MainActivity : ComponentActivity() {
         val tempFile = "/data/ota_package/firmware.zip.tmp"
         val downloadUrl = "${PrefsManager.getServerBaseUrl()}/${info.filename}"
         
-        // Create task state
         val taskState = TaskState(
             taskId = UUID.randomUUID().toString(),
             stage = Stage.DOWNLOADING,
@@ -196,13 +203,10 @@ class MainActivity : ComponentActivity() {
         TaskStateManager.saveTaskState(this, taskState)
         stage = Stage.DOWNLOADING
         
-        // Bind to service and start download
         val intent = Intent(this, DownloadService::class.java)
         bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
         
-        // Start download in background
         downloadJob = CoroutineScope(Dispatchers.Main).launch {
-            // Bind first
             delay(100)
             downloadService?.startDownload(downloadUrl, tempFile, info.md5)
         }
@@ -213,7 +217,6 @@ class MainActivity : ComponentActivity() {
             val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
             powerManager.reboot(null)
         } catch (e: Exception) {
-            // Fallback
             Runtime.getRuntime().exec("reboot")
         }
     }
@@ -223,36 +226,28 @@ class MainActivity : ComponentActivity() {
             val targetFile = "/data/ota_package/firmware.zip"
             
             try {
-                // Update stage
                 TaskStateManager.updateStage(this@MainActivity, Stage.PREPARING)
                 stage = Stage.PREPARING
                 
-                // Extract payload info (免解压)
                 val payloadInfo = withContext(Dispatchers.IO) {
                     ZipPayloadExtractor.extract(targetFile)
                 }
                 
-                // Update stage
                 TaskStateManager.updateStage(this@MainActivity, Stage.APPLYING)
                 stage = Stage.APPLYING
                 
-                // Apply payload
-                val fileUri = "file://$targetFile"
                 val success = UpdateEngineWrapper.bind(object : UpdateEngineCallbackAdapter() {
                     override fun onPayloadApplicationComplete(errorCode: Int) {
                         CoroutineScope(Dispatchers.Main).launch {
                             if (errorCode == 0) {
-                                // Success - need reboot
                                 PrefsManager.setPendingSlotVersion(
                                     TaskStateManager.loadTaskState(this@MainActivity)?.pendingVersion ?: ""
                                 )
                                 TaskStateManager.updateStage(this@MainActivity, Stage.REBOOT_PENDING)
-                                // Delete firmware.zip since update_engine has read it
                                 FileCleaner.cleanFinalFile(this@MainActivity)
                                 stage = Stage.REBOOT_PENDING
                                 showRebootDialogFlag = true
                             } else {
-                                // Error
                                 FileCleaner.cleanFinalFile(this@MainActivity)
                                 TaskStateManager.setError(this@MainActivity, "升级失败，错误码: $errorCode")
                                 stage = Stage.ERROR
@@ -260,15 +255,11 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                     }
-                    
-                    override fun onStatusUpdate(status: Int, percent: Float) {
-                        // Update UI progress if needed
-                    }
                 })
                 
                 if (success) {
                     UpdateEngineWrapper.applyPayload(
-                        fileUri,
+                        "file://$targetFile",
                         payloadInfo.offset,
                         payloadInfo.size,
                         payloadInfo.headers
@@ -285,7 +276,6 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        // Refresh state from TaskStateManager
         val state = TaskStateManager.loadTaskState(this)
         if (state != null) {
             stage = state.stage
@@ -333,15 +323,12 @@ fun MainScreen(
     var serverUrl by remember { mutableStateOf(PrefsManager.getServerBaseUrl() ?: "") }
     var currentVersion by remember { mutableStateOf(PrefsManager.getCurrentVersion()) }
     var progress by remember { mutableFloatStateOf(0f) }
-    var downloadSpeed by remember { mutableStateOf("") }
 
-    // Refresh server URL and version when screen is shown
     LaunchedEffect(Unit) {
         serverUrl = PrefsManager.getServerBaseUrl() ?: ""
         currentVersion = PrefsManager.getCurrentVersion()
     }
 
-    // Watch for download complete and start apply payload
     LaunchedEffect(stage) {
         if (stage == Stage.DOWNLOADED) {
             onApplyPayload()
@@ -351,13 +338,29 @@ fun MainScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("固件升级", color = Color.White) },
+                title = { Text("固件升级", color = WhiteText) },
                 colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = Color(0xFF2196F3)
-                )
+                    containerColor = TechBlue
+                ),
+                actions = {
+                    IconButton(onClick = onNavigateToScan) {
+                        Icon(
+                            imageVector = Icons.Default.QrCodeScanner,
+                            contentDescription = "扫码配置",
+                            tint = WhiteText
+                        )
+                    }
+                    IconButton(onClick = onNavigateToSettings) {
+                        Icon(
+                            imageVector = Icons.Default.Settings,
+                            contentDescription = "设置",
+                            tint = WhiteText
+                        )
+                    }
+                }
             )
         },
-        containerColor = Color(0xFF121212)
+        containerColor = DarkBackground
     ) { innerPadding ->
         Column(
             modifier = Modifier
@@ -366,110 +369,28 @@ fun MainScreen(
                 .padding(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            // Server address row
-            InfoRow(
-                label = "当前服务器地址",
-                value = if (serverUrl.isNotBlank()) serverUrl else "未配置",
-                onClick = onNavigateToSettings
-            )
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            // Current version row
-            InfoRow(
-                label = "当前版本",
-                value = if (currentVersion.isNotBlank()) currentVersion else "未知"
-            )
-
-            Spacer(modifier = Modifier.height(32.dp))
-
-            // Main content based on stage
             when (stage) {
-                Stage.IDLE -> {
-                    // Check update button
-                    Button(
-                        onClick = { onCheckUpdate() },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(56.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = Color(0xFF2196F3)
-                        ),
-                        shape = RoundedCornerShape(8.dp)
-                    ) {
-                        Text("检查更新", fontSize = 18.sp)
-                    }
-
-                    Spacer(modifier = Modifier.weight(1f))
-
-                    // Bottom buttons row
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(16.dp)
-                    ) {
-                        OutlinedButton(
-                            onClick = onNavigateToScan,
-                            modifier = Modifier
-                                .weight(1f)
-                                .height(48.dp)
-                        ) {
-                            Text("扫码配置")
-                        }
-
-                        OutlinedButton(
-                            onClick = onNavigateToSettings,
-                            modifier = Modifier
-                                .weight(1f)
-                                .height(48.dp)
-                        ) {
-                            Text("手动输入")
-                        }
-                    }
-                }
-
-                Stage.CHECK_PREPARE -> {
-                    LoadingContent(message = "正在检查更新...")
-                }
-
-                Stage.DOWNLOADING -> {
-                    DownloadContent(
-                        progress = progress,
-                        speed = downloadSpeed
-                    )
-                }
-
-                Stage.DOWNLOADED -> {
-                    LoadingContent(message = "下载完成，准备中...")
-                }
-
-                Stage.PREPARING -> {
-                    LoadingContent(message = "准备中...")
-                }
-
-                Stage.APPLYING -> {
-                    ApplyingContent(progress = progress)
-                }
-
-                Stage.REBOOT_PENDING -> {
-                    RebootPendingContent(onReboot = onReboot)
-                }
-
-                Stage.ERROR -> {
-                    ErrorContent(
-                        message = errorMessage ?: "未知错误",
-                        onRetry = {
-                            onStageChange(Stage.IDLE)
-                        },
-                        onDismiss = {
-                            onStageChange(Stage.IDLE)
-                        }
-                    )
-                }
+                Stage.IDLE -> IdleScreen(
+                    serverUrl = serverUrl,
+                    currentVersion = currentVersion,
+                    onEditServerUrl = onNavigateToSettings,
+                    onCheckUpdate = onCheckUpdate
+                )
+                Stage.CHECK_PREPARE -> LoadingScreen("正在检查更新...")
+                Stage.DOWNLOADING -> DownloadScreen(progress = progress)
+                Stage.DOWNLOADED -> LoadingScreen("下载完成，准备中...")
+                Stage.PREPARING -> LoadingScreen("准备中...")
+                Stage.APPLYING -> ApplyingScreen(progress = progress)
+                Stage.REBOOT_PENDING -> RebootPendingScreen(onReboot = onReboot)
+                Stage.ERROR -> ErrorScreen(
+                    message = errorMessage ?: "未知错误",
+                    onRetry = { onStageChange(Stage.IDLE) },
+                    onDismiss = { onStageChange(Stage.IDLE) }
+                )
             }
         }
     }
 
-    // Dialogs
     if (showNoUpdateDialog) {
         AlertDialog(
             onDismissRequest = { onDismissNoUpdate() },
@@ -510,7 +431,7 @@ fun MainScreen(
         AlertDialog(
             onDismissRequest = { onDismissRebootDialog() },
             title = { Text("重启确认") },
-            text = { Text("系统已准备就绪，是否立即重启？") },
+            text = { Text("系统已准备就绪，请立即重启设备以完成升级") },
             confirmButton = {
                 TextButton(onClick = {
                     onDismissRebootDialog()
@@ -529,6 +450,51 @@ fun MainScreen(
 }
 
 @Composable
+fun IdleScreen(
+    serverUrl: String,
+    currentVersion: String,
+    onEditServerUrl: () -> Unit,
+    onCheckUpdate: () -> Unit
+) {
+    Column(
+        modifier = Modifier.fillMaxSize(),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Spacer(modifier = Modifier.height(24.dp))
+        
+        InfoRow(
+            label = "当前服务器地址",
+            value = if (serverUrl.isNotBlank()) serverUrl else "未配置",
+            onClick = onEditServerUrl
+        )
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        InfoRow(
+            label = "当前版本",
+            value = if (currentVersion.isNotBlank()) currentVersion else "未知"
+        )
+
+        Spacer(modifier = Modifier.height(48.dp))
+
+        Button(
+            onClick = onCheckUpdate,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(56.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = TechBlue
+            ),
+            shape = RoundedCornerShape(8.dp)
+        ) {
+            Text("检查更新", fontSize = 18.sp, color = WhiteText)
+        }
+        
+        Spacer(modifier = Modifier.weight(1f))
+    }
+}
+
+@Composable
 fun InfoRow(
     label: String,
     value: String,
@@ -541,19 +507,19 @@ fun InfoRow(
                 if (onClick != null) Modifier.clickable(onClick = onClick)
                 else Modifier
             )
-            .background(Color(0xFF1E1E1E), RoundedCornerShape(8.dp))
+            .background(CardBackground, RoundedCornerShape(8.dp))
             .padding(16.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Text(
             text = label,
-            color = Color(0xFFB0B0B0),
+            color = GrayText,
             fontSize = 14.sp
         )
         Spacer(modifier = Modifier.width(16.dp))
         Text(
             text = value,
-            color = Color.White,
+            color = WhiteText,
             fontSize = 14.sp,
             fontWeight = FontWeight.Medium
         )
@@ -561,32 +527,32 @@ fun InfoRow(
 }
 
 @Composable
-fun LoadingContent(message: String) {
+fun LoadingScreen(message: String) {
     Column(
         modifier = Modifier.fillMaxSize(),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-        CircularProgressIndicator(color = Color(0xFF2196F3))
+        CircularProgressIndicator(color = TechBlue)
         Spacer(modifier = Modifier.height(16.dp))
         Text(
             text = message,
-            color = Color.White,
+            color = WhiteText,
             fontSize = 16.sp
         )
     }
 }
 
 @Composable
-fun DownloadContent(progress: Float, speed: String) {
+fun DownloadScreen(progress: Float) {
     Column(
         modifier = Modifier.fillMaxSize(),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
         Text(
-            text = "正在下载...",
-            color = Color.White,
+            text = "正在下载固件...",
+            color = WhiteText,
             fontSize = 18.sp,
             fontWeight = FontWeight.Medium
         )
@@ -598,54 +564,7 @@ fun DownloadContent(progress: Float, speed: String) {
             modifier = Modifier
                 .fillMaxWidth()
                 .height(8.dp),
-            color = Color(0xFF2196F3),
-            trackColor = Color(0xFF3D3D3D)
-        )
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Text(
-                text = "${(progress * 100).toInt()}%",
-                color = Color.White,
-                fontSize = 14.sp
-            )
-            if (speed.isNotBlank()) {
-                Text(
-                    text = speed,
-                    color = Color(0xFFB0B0B0),
-                    fontSize = 14.sp
-                )
-            }
-        }
-    }
-}
-
-@Composable
-fun ApplyingContent(progress: Float) {
-    Column(
-        modifier = Modifier.fillMaxSize(),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-    ) {
-        Text(
-            text = "正在应用更新...",
-            color = Color.White,
-            fontSize = 18.sp,
-            fontWeight = FontWeight.Medium
-        )
-
-        Spacer(modifier = Modifier.height(24.dp))
-
-        LinearProgressIndicator(
-            progress = { progress },
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(8.dp),
-            color = Color(0xFF2196F3),
+            color = TechBlue,
             trackColor = Color(0xFF3D3D3D)
         )
 
@@ -653,14 +572,49 @@ fun ApplyingContent(progress: Float) {
 
         Text(
             text = "${(progress * 100).toInt()}%",
-            color = Color.White,
+            color = WhiteText,
             fontSize = 14.sp
         )
     }
 }
 
 @Composable
-fun RebootPendingContent(onReboot: () -> Unit) {
+fun ApplyingScreen(progress: Float) {
+    Column(
+        modifier = Modifier.fillMaxSize(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text(
+            text = "正在应用更新...",
+            color = WhiteText,
+            fontSize = 18.sp,
+            fontWeight = FontWeight.Medium
+        )
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        LinearProgressIndicator(
+            progress = { progress },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(8.dp),
+            color = TechBlue,
+            trackColor = Color(0xFF3D3D3D)
+        )
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        Text(
+            text = "${(progress * 100).toInt()}%",
+            color = WhiteText,
+            fontSize = 14.sp
+        )
+    }
+}
+
+@Composable
+fun RebootPendingScreen(onReboot: () -> Unit) {
     Column(
         modifier = Modifier.fillMaxSize(),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -668,7 +622,7 @@ fun RebootPendingContent(onReboot: () -> Unit) {
     ) {
         Text(
             text = "系统已准备就绪，请重启设备",
-            color = Color.White,
+            color = WhiteText,
             fontSize = 18.sp,
             fontWeight = FontWeight.Medium
         )
@@ -681,17 +635,17 @@ fun RebootPendingContent(onReboot: () -> Unit) {
                 .fillMaxWidth()
                 .height(56.dp),
             colors = ButtonDefaults.buttonColors(
-                containerColor = Color(0xFF2196F3)
+                containerColor = TechBlue
             ),
             shape = RoundedCornerShape(8.dp)
         ) {
-            Text("立即重启", fontSize = 18.sp)
+            Text("立即重启", fontSize = 18.sp, color = WhiteText)
         }
     }
 }
 
 @Composable
-fun ErrorContent(
+fun ErrorScreen(
     message: String,
     onRetry: () -> Unit,
     onDismiss: () -> Unit
@@ -712,7 +666,7 @@ fun ErrorContent(
 
         Text(
             text = message,
-            color = Color(0xFFB0B0B0),
+            color = GrayText,
             fontSize = 14.sp
         )
 
@@ -722,12 +676,12 @@ fun ErrorContent(
             horizontalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             OutlinedButton(onClick = onDismiss) {
-                Text("取消")
+                Text("取消", color = TechBlue)
             }
             Button(
                 onClick = onRetry,
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = Color(0xFF2196F3)
+                    containerColor = TechBlue
                 )
             ) {
                 Text("重试")
