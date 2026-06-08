@@ -180,10 +180,6 @@ class MainActivity : ComponentActivity() {
                     errorMessage = result.message
                     stage = Stage.ERROR
                 }
-                else -> {
-                    errorMessage = "未知错误"
-                    stage = Stage.ERROR
-                }
             }
         }
     }
