@@ -1,12 +1,14 @@
 package com.example.firmwaremanagement.scanner
 
+import android.Manifest
 import android.app.Activity
-import android.content.Context
-import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -15,8 +17,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
 import com.example.firmwaremanagement.storage.PrefsManager
-import com.google.zxing.BarcodeFormat
 import com.google.zxing.ResultPoint
 import com.journeyapps.barcodescanner.BarcodeCallback
 import com.journeyapps.barcodescanner.BarcodeResult
@@ -60,6 +62,30 @@ fun ScanScreen(
     val context = LocalContext.current
     var isScanning by remember { mutableStateOf(true) }
     var showDialog by remember { mutableStateOf<String?>(null) }
+    var hasCameraPermission by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.CAMERA
+            ) == PackageManager.PERMISSION_GRANTED
+        )
+    }
+
+    val permissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        hasCameraPermission = isGranted
+        if (!isGranted) {
+            Toast.makeText(context, "需要相机权限才能扫描二维码", Toast.LENGTH_SHORT).show()
+            onCancel()
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        if (!hasCameraPermission) {
+            permissionLauncher.launch(Manifest.permission.CAMERA)
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -80,7 +106,7 @@ fun ScanScreen(
             verticalArrangement = Arrangement.Center,
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            if (isScanning) {
+            if (isScanning && hasCameraPermission) {
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
@@ -112,6 +138,11 @@ fun ScanScreen(
 
                 Text(
                     text = "将二维码放入框内，自动识别",
+                    modifier = Modifier.padding(16.dp)
+                )
+            } else if (!hasCameraPermission) {
+                Text(
+                    text = "正在请求相机权限...",
                     modifier = Modifier.padding(16.dp)
                 )
             }

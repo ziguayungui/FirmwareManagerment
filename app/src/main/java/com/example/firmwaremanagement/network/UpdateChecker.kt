@@ -19,8 +19,8 @@ sealed class UpdateCheckResult {
 object UpdateChecker {
 
     private val client = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.SECONDS)
         .build()
 
     fun checkForUpdate(serverUrl: String): Result<UpdateInfo> {
