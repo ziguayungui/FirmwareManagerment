@@ -17,6 +17,8 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -31,6 +33,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import com.example.firmwaremanagement.storage.PrefsManager
 import com.example.firmwaremanagement.ui.theme.FirmwareManagementTheme
@@ -39,6 +42,7 @@ import java.net.URL
 class SettingsActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        PrefsManager.init(this)
         setContent {
             FirmwareManagementTheme {
                 SettingsScreen(onBack = { finish() })
@@ -114,12 +118,23 @@ fun SettingsScreen(onBack: () -> Unit) {
                 isError = errorMessage != null,
                 supportingText = {
                     if (errorMessage != null) {
-                        Text(text = errorMessage!!, color = androidx.compose.ui.graphics.Color.Red)
+                        Text(text = errorMessage!!, color = Color.Red)
                     } else {
                         Text("示例：http://192.168.1.100:8080")
                     }
                 },
-                singleLine = true
+                singleLine = true,
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedTextColor = Color.Black,
+                    unfocusedTextColor = Color.Black,
+                    focusedLabelColor = Color.Black,
+                    unfocusedLabelColor = Color.Gray,
+                    focusedPlaceholderColor = Color.Gray,
+                    unfocusedPlaceholderColor = Color.Gray,
+                    focusedBorderColor = Color(0xFF2196F3),
+                    unfocusedBorderColor = Color.Gray,
+                    cursorColor = Color(0xFF2196F3)
+                )
             )
 
             Spacer(modifier = Modifier.height(24.dp))

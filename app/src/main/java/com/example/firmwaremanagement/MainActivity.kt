@@ -78,10 +78,11 @@ import kotlinx.coroutines.withContext
 import java.util.UUID
 
 val TechBlue = Color(0xFF2196F3)
-val DarkBackground = Color(0xFF121212)
-val CardBackground = Color(0xFF1E1E1E)
-val WhiteText = Color(0xFFFFFFFF)
-val GrayText = Color(0xFFB0B0B0)
+val TechBlueDark = Color(0xFF1976D2)
+val DarkBackground = Color(0xFFFFFFFF)  // 白色背景
+val CardBackground = Color(0xFFF5F5F5)  // 浅灰色卡片背景
+val WhiteText = Color(0xFFFFFFFF)      // 白色文字（用于蓝色按钮上）
+val GrayText = Color(0xFF000000)       // 黑色文字（用于白色背景上）
 
 class MainActivity : ComponentActivity() {
 
@@ -405,11 +406,12 @@ fun MainScreen(
     if (showNoUpdateDialog) {
         AlertDialog(
             onDismissRequest = { onDismissNoUpdate() },
-            title = { Text("提示") },
-            text = { Text("已是最新版本") },
+            containerColor = Color.White,
+            title = { Text("提示", color = Color.Black) },
+            text = { Text("已是最新版本", color = Color.Black) },
             confirmButton = {
                 TextButton(onClick = { onDismissNoUpdate() }) {
-                    Text("确定")
+                    Text("确定", color = Color(0xFF2196F3))
                 }
             }
         )
@@ -418,21 +420,22 @@ fun MainScreen(
     if (showNewUpdateDialog && pendingUpdateInfo != null) {
         AlertDialog(
             onDismissRequest = { onDismissNewUpdate() },
-            title = { Text("发现新版本") },
+            containerColor = Color.White,
+            title = { Text("发现新版本", color = Color.Black) },
             text = {
                 Column {
-                    Text("版本: ${pendingUpdateInfo?.version}")
-                    Text("文件名: ${pendingUpdateInfo?.filename}")
+                    Text("版本: ${pendingUpdateInfo?.version}", color = Color.Black)
+                    Text("文件名: ${pendingUpdateInfo?.filename}", color = Color.Black)
                 }
             },
             confirmButton = {
                 TextButton(onClick = { onStartNewDownload() }) {
-                    Text("立即更新")
+                    Text("立即更新", color = Color(0xFF2196F3))
                 }
             },
             dismissButton = {
                 TextButton(onClick = { onDismissNewUpdate() }) {
-                    Text("暂不更新")
+                    Text("暂不更新", color = Color.Gray)
                 }
             }
         )
@@ -441,19 +444,20 @@ fun MainScreen(
     if (showRebootDialog) {
         AlertDialog(
             onDismissRequest = { onDismissRebootDialog() },
-            title = { Text("重启确认") },
-            text = { Text("系统已准备就绪，请立即重启设备以完成升级") },
+            containerColor = Color.White,
+            title = { Text("重启确认", color = Color.Black) },
+            text = { Text("系统已准备就绪，请立即重启设备以完成升级", color = Color.Black) },
             confirmButton = {
                 TextButton(onClick = {
                     onDismissRebootDialog()
                     onReboot()
                 }) {
-                    Text("立即重启")
+                    Text("立即重启", color = Color(0xFF2196F3))
                 }
             },
             dismissButton = {
                 TextButton(onClick = { onDismissRebootDialog() }) {
-                    Text("稍后重启")
+                    Text("稍后重启", color = Color.Gray)
                 }
             }
         )
@@ -524,13 +528,13 @@ fun InfoRow(
     ) {
         Text(
             text = label,
-            color = GrayText,
+            color = Color.Black,
             fontSize = 14.sp
         )
         Spacer(modifier = Modifier.width(16.dp))
         Text(
             text = value,
-            color = WhiteText,
+            color = Color.Black,
             fontSize = 14.sp,
             fontWeight = FontWeight.Medium
         )

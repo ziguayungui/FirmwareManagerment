@@ -15,27 +15,35 @@ object PrefsManager {
     private lateinit var prefs: SharedPreferences
 
     fun init(context: Context) {
-        prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        if (!::prefs.isInitialized) {
+            prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        }
     }
 
     fun getServerBaseUrl(): String? {
-        return prefs.getString(KEY_SERVER_BASE_URL, null)
+        return if (::prefs.isInitialized) prefs.getString(KEY_SERVER_BASE_URL, null) else null
     }
 
     fun setServerBaseUrl(url: String) {
-        prefs.edit().putString(KEY_SERVER_BASE_URL, url).apply()
+        if (::prefs.isInitialized) {
+            prefs.edit().putString(KEY_SERVER_BASE_URL, url).apply()
+        }
     }
 
     fun getPendingSlotVersion(): String? {
-        return prefs.getString(KEY_PENDING_SLOT_VERSION, null)
+        return if (::prefs.isInitialized) prefs.getString(KEY_PENDING_SLOT_VERSION, null) else null
     }
 
     fun setPendingSlotVersion(version: String) {
-        prefs.edit().putString(KEY_PENDING_SLOT_VERSION, version).apply()
+        if (::prefs.isInitialized) {
+            prefs.edit().putString(KEY_PENDING_SLOT_VERSION, version).apply()
+        }
     }
 
     fun clearPendingSlotVersion() {
-        prefs.edit().remove(KEY_PENDING_SLOT_VERSION).apply()
+        if (::prefs.isInitialized) {
+            prefs.edit().remove(KEY_PENDING_SLOT_VERSION).apply()
+        }
     }
 
     fun isServerConfigured(): Boolean {
@@ -47,10 +55,12 @@ object PrefsManager {
     }
 
     fun getLastCheckTime(): Long {
-        return prefs.getLong(KEY_LAST_CHECK_TIME, 0L)
+        return if (::prefs.isInitialized) prefs.getLong(KEY_LAST_CHECK_TIME, 0L) else 0L
     }
 
     fun setLastCheckTime(time: Long) {
-        prefs.edit().putLong(KEY_LAST_CHECK_TIME, time).apply()
+        if (::prefs.isInitialized) {
+            prefs.edit().putLong(KEY_LAST_CHECK_TIME, time).apply()
+        }
     }
 }

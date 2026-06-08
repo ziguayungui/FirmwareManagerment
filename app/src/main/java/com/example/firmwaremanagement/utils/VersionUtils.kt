@@ -5,6 +5,8 @@ import android.util.Log
 object VersionUtils {
 
     private const val TAG = "VersionUtils"
+    
+    private val VERSION_PATTERN = Regex("^V\\d\\.\\d\\.\\d$")
 
     fun compareVersions(version1: String, version2: String): Int {
         Log.d(TAG, "compareVersions: v1='$version1', v2='$version2'")
@@ -46,6 +48,16 @@ object VersionUtils {
             return false
         }
         
+        if (!isValidVersion(newVersion)) {
+            Log.w(TAG, "New version '$newVersion' is not valid (must be Vx.x.x)")
+            return false
+        }
+        
+        if (!isValidVersion(currentVersion)) {
+            Log.w(TAG, "Current version '$currentVersion' is not valid, assuming newer version available")
+            return true
+        }
+        
         val result = compareVersions(currentVersion, newVersion)
         Log.d(TAG, "isNewerVersion: current='$currentVersion', new='$newVersion', result=$result")
         return result < 0
@@ -55,8 +67,19 @@ object VersionUtils {
         return compareVersions(currentVersion, oldVersion) > 0
     }
 
+    fun isValidVersion(version: String): Boolean {
+        val isValid = VERSION_PATTERN.matches(version)
+        Log.d(TAG, "isValidVersion: '$version' -> $isValid")
+        return isValid
+    }
+
     private fun parseVersion(version: String): List<Int> {
         Log.d(TAG, "parseVersion: input='$version'")
+        
+        if (!isValidVersion(version)) {
+            Log.w(TAG, "Invalid version format, extracting numeric parts")
+        }
+        
         val numericOnly = version.replace(Regex("^[^0-9]*"), "")
         Log.d(TAG, "numericOnly: '$numericOnly'")
         
