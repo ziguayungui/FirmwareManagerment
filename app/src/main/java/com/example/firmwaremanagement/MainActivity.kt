@@ -65,7 +65,6 @@ import com.example.firmwaremanagement.network.DownloadService
 import com.example.firmwaremanagement.network.UpdateChecker
 import com.example.firmwaremanagement.network.UpdateCheckResult
 import com.example.firmwaremanagement.scanner.ScanActivity
-import com.example.firmwaremanagement.storage.FileCleaner
 import com.example.firmwaremanagement.storage.PrefsManager
 import com.example.firmwaremanagement.storage.TaskStateManager
 import com.example.firmwaremanagement.ui.SettingsActivity
@@ -259,8 +258,18 @@ class MainActivity : ComponentActivity() {
             try {
                 stage = Stage.PREPARING
                 
+                // 从 ZIP 中提取 payload.bin
                 val payloadInfo = withContext(Dispatchers.IO) {
-                    ZipPayloadExtractor.extract(targetFile)
+                    ZipPayloadExtractor.extract(this@MainActivity, targetFile)
+                }
+                
+                // 提取完成后删除原 ZIP 文件，释放空间
+                withContext(Dispatchers.IO) {
+                    val zipFile = java.io.File(targetFile)
+                    if (zipFile.exists()) {
+                        zipFile.delete()
+                        Log.d(TAG, "applyPayloadAfterDownload: deleted original zip")
+                    }
                 }
                 
                 stage = Stage.APPLYING
@@ -268,13 +277,14 @@ class MainActivity : ComponentActivity() {
                 val success = UpdateEngineWrapper.bind(object : UpdateEngineCallbackAdapter() {
                     override fun onPayloadApplicationComplete(errorCode: Int) {
                         CoroutineScope(Dispatchers.Main).launch {
+                            // 清理提取的 payload 文件
+                            ZipPayloadExtractor.cleanup(this@MainActivity)
+                            
                             if (errorCode == 0) {
                                 PrefsManager.setPendingSlotVersion(pendingVersionForSlot)
-                                FileCleaner.cleanFinalFile(this@MainActivity)
                                 stage = Stage.REBOOT_PENDING
                                 showRebootDialogFlag = true
                             } else {
-                                FileCleaner.cleanFinalFile(this@MainActivity)
                                 stage = Stage.ERROR
                                 errorMessage = "升级失败，错误码: $errorCode"
                             }
@@ -283,15 +293,23 @@ class MainActivity : ComponentActivity() {
                 })
                 
                 if (success) {
+                    Log.d(TAG, "applyPayloadAfterDownload: UpdateEngine bound, registering listener")
+                    UpdateEngineWrapper.bindListener()
                     UpdateEngineWrapper.applyPayload(
-                        "file://$targetFile",
-                        payloadInfo.offset,
+                        "file://${payloadInfo.payloadFile}",
+                        0,
                         payloadInfo.size,
                         payloadInfo.headers
                     )
+                    Log.d(TAG, "applyPayloadAfterDownload: applyPayload called, waiting for callback")
+                } else {
+                    Log.e(TAG, "applyPayloadAfterDownload: failed to bind UpdateEngine")
+                    ZipPayloadExtractor.cleanup(this@MainActivity)
+                    stage = Stage.ERROR
+                    errorMessage = "设备不支持OTA升级"
                 }
             } catch (e: Exception) {
-                FileCleaner.cleanFinalFile(this@MainActivity)
+                ZipPayloadExtractor.cleanup(this@MainActivity)
                 stage = Stage.ERROR
                 errorMessage = "准备升级失败: ${e.message}"
             }
