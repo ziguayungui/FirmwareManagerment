@@ -1,130 +1,431 @@
 package com.example.firmwaremanagement.engine
 
+import android.os.Binder
 import android.os.IBinder
-import android.os.ParcelFileDescriptor
+import android.os.Parcel
 import android.util.Log
-import java.io.File
-import java.lang.reflect.Constructor
 
 object UpdateEngineWrapper {
 
     private const val TAG = "UpdateEngineWrapper"
-    private var engine: Any? = null
+    private var engine: Any? = null          // IUpdateEngine 代理对象
     private var engineClass: Class<*>? = null
+    private var engineCallbackStubClass: Class<*>? = null
     private var callback: UpdateEngineCallbackAdapter? = null
 
+    /**
+     * 绑定 update_engine 服务并注册回调。
+     * 通过 ServiceManager 获取 IBinder，再通过 IUpdateEngine.Stub.asInterface() 转为 AIDL 代理。
+     * 回调通过自定义 Binder + IUpdateEngineCallback.Stub.asInterface() 实现，确保 Binder IPC 兼容。
+     */
     fun bind(callback: UpdateEngineCallbackAdapter): Boolean {
         this.callback = callback
-        try {
-            engineClass = Class.forName("android.os.UpdateEngine")
-            engine = engineClass!!.getDeclaredConstructor().newInstance()
-            Log.d(TAG, "bind: UpdateEngine created successfully")
-            return true
+
+        // --- 步骤1：获取 update_engine 服务 ---
+        val service = try {
+            getUpdateEngineService()
         } catch (e: Exception) {
-            Log.e(TAG, "bind: failed to create UpdateEngine: ${e.message}")
+            Log.e(TAG, "bind: [step1] ServiceManager.getService failed: ${e.message}", e)
+            null
+        }
+        if (service == null) {
+            Log.e(TAG, "bind: [step1] update_engine service not found, running diagnose...")
+            diagnose()
+            this.callback = null
+            return false
+        }
+        Log.d(TAG, "bind: [step1] got update_engine service: $service")
+
+        // --- 步骤2：IUpdateEngine.Stub.asInterface ---
+        try {
+            engineClass = Class.forName("android.os.IUpdateEngine")
+            val stubClass = Class.forName("android.os.IUpdateEngine\$Stub")
+            val asInterface = stubClass.getMethod("asInterface", IBinder::class.java)
+            engine = asInterface.invoke(null, service)
+        } catch (e: Exception) {
+            Log.e(TAG, "bind: [step2] IUpdateEngine.Stub.asInterface failed: ${e.message}", e)
             engine = null
             engineClass = null
+            this.callback = null
             return false
+        }
+        Log.d(TAG, "bind: [step2] IUpdateEngine.Stub.asInterface success: $engine")
+
+        // --- 步骤3：创建 Binder 回调 + asInterface 包装 ---
+        val cbWrapper: Any
+        try {
+            engineCallbackStubClass = Class.forName("android.os.IUpdateEngineCallback\$Stub")
+
+            // 3a. 读取 AIDL descriptor 和交易码
+            val descriptor = readStaticStringField(engineCallbackStubClass!!, "DESCRIPTOR")
+                ?: "android.os.IUpdateEngineCallback"
+            val transOnStatusUpdate = readStaticIntField(engineCallbackStubClass!!, "TRANSACTION_onStatusUpdate")
+            val transOnPayloadComplete = readStaticIntField(engineCallbackStubClass!!, "TRANSACTION_onPayloadApplicationComplete")
+            Log.d(TAG, "bind: [step3] descriptor=$descriptor, onStatusUpdate=$transOnStatusUpdate, onPayloadComplete=$transOnPayloadComplete")
+
+            // 3b. 创建 Binder 子类，处理来自 update_engine 服务的回调
+            val binder = object : Binder() {
+                override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
+                    try {
+                        when (code) {
+                            transOnStatusUpdate -> {
+                                data.enforceInterface(descriptor)
+                                val status = data.readInt()
+                                val percentage = data.readFloat()
+                                callback.onStatusUpdate(status, percentage)
+                                Log.d(TAG, "onStatusUpdate: status=$status, percentage=$percentage")
+                                return true
+                            }
+                            transOnPayloadComplete -> {
+                                data.enforceInterface(descriptor)
+                                val errorCode = data.readInt()
+                                callback.onPayloadApplicationComplete(errorCode)
+                                Log.d(TAG, "onPayloadApplicationComplete: errorCode=$errorCode")
+                                return true
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "onTransact error: ${e.message}", e)
+                    }
+                    return super.onTransact(code, data, reply, flags)
+                }
+            }
+
+            // 3c. 通过 Stub.asInterface(binder) 包装为 IUpdateEngineCallback
+            val asInterfaceCb = engineCallbackStubClass!!.getMethod("asInterface", IBinder::class.java)
+            cbWrapper = asInterfaceCb.invoke(null, binder)!!
+            Log.d(TAG, "bind: [step3] callback Binder created: $cbWrapper")
+        } catch (e: Exception) {
+            Log.e(TAG, "bind: [step3] callback creation failed: ${e.message}", e)
+            engine = null
+            engineClass = null
+            engineCallbackStubClass = null
+            this.callback = null
+            return false
+        }
+
+        // --- 步骤4：engine.bind(callback) ---
+        return try {
+            val callbackIface = Class.forName("android.os.IUpdateEngineCallback")
+            val bindMethod = engineClass!!.getMethod("bind", callbackIface)
+            val result = bindMethod.invoke(engine, cbWrapper) as Boolean
+            Log.d(TAG, "bind: [step4] engine.bind returned $result")
+            result
+        } catch (e: Exception) {
+            Log.e(TAG, "bind: [step4] engine.bind invocation failed: ${e.message}", e)
+            engine = null
+            engineClass = null
+            engineCallbackStubClass = null
+            this.callback = null
+            false
         }
     }
 
+    /** 解绑并释放资源 */
     fun unbind() {
+        try {
+            val eng = engine
+            val cls = engineClass
+            val cbIface = Class.forName("android.os.IUpdateEngineCallback")
+            if (eng != null && cls != null) {
+                val unbindMethod = cls.getMethod("unbind", cbIface)
+                unbindMethod.invoke(eng, null) // 传 null 解绑所有回调
+            }
+        } catch (_: Exception) {
+        }
         engine = null
         engineClass = null
+        engineCallbackStubClass = null
         callback = null
         Log.d(TAG, "unbind: UpdateEngine released")
     }
 
+    /** 发起 payload 升级 */
     fun applyPayload(fileUri: String, offset: Long, size: Long, headers: Array<String>) {
         val eng = engine ?: run {
             Log.e(TAG, "applyPayload: UpdateEngine not initialized")
             callback?.onPayloadApplicationComplete(1)
             return
         }
-
+        val cls = engineClass ?: run {
+            callback?.onPayloadApplicationComplete(1)
+            return
+        }
         Log.d(TAG, "applyPayload: fileUri=$fileUri, offset=$offset, size=$size")
-
         try {
-            val engineCls = engineClass!!
-
-            // 尝试调用 applyPayload(String, long, long, String[])
-            try {
-                val method = engineCls.getMethod(
-                    "applyPayload",
-                    String::class.java,
-                    Long::class.javaPrimitiveType,
-                    Long::class.javaPrimitiveType,
-                    Array<String>::class.java
-                )
-                method.invoke(eng, fileUri, offset, size, headers)
-                Log.d(TAG, "applyPayload: called via string overload")
-            } catch (e: NoSuchMethodException) {
-                // 尝试调用 applyPayload(ParcelFileDescriptor, long, long, String[])
-                try {
-                    val file = File(fileUri.replace("file://", ""))
-                    val pfd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
-                    val method = engineCls.getMethod(
-                        "applyPayload",
-                        ParcelFileDescriptor::class.java,
-                        Long::class.javaPrimitiveType,
-                        Long::class.javaPrimitiveType,
-                        Array<String>::class.java
-                    )
-                    method.invoke(eng, pfd, offset, size, headers)
-                    Log.d(TAG, "applyPayload: called via ParcelFileDescriptor overload")
-                } catch (e2: Exception) {
-                    Log.e(TAG, "applyPayload: all overloads failed: ${e2.message}")
-                    callback?.onPayloadApplicationComplete(1)
-                }
-            }
+            val method = cls.getMethod(
+                "applyPayload",
+                String::class.java,
+                Long::class.javaPrimitiveType,
+                Long::class.javaPrimitiveType,
+                Array<String>::class.java
+            )
+            method.invoke(eng, fileUri, offset, size, headers)
+            Log.d(TAG, "applyPayload: called successfully via AIDL")
         } catch (e: Exception) {
-            Log.e(TAG, "applyPayload: unexpected error: ${e.message}")
+            Log.e(TAG, "applyPayload: failed: ${e.message}")
             callback?.onPayloadApplicationComplete(1)
         }
     }
 
-    fun bindListener(): Boolean {
-        val eng = engine ?: return false
-        val engineCls = engineClass ?: return false
-        val cb = callback ?: return false
+    fun isBound(): Boolean = engine != null
 
+    /** 取消当前升级 */
+    fun cancel() {
+        val eng = engine ?: return
+        val cls = engineClass ?: return
         try {
-            // android.os.UpdateEngine 使用 UpdateEngineCallback
-            // 需要通过 Binder 机制注册 callback
-            val callbackClass = Class.forName("android.os.UpdateEngineCallback")
-
-            // 创建动态代理
-            val proxy = java.lang.reflect.Proxy.newProxyInstance(
-                callbackClass.classLoader,
-                arrayOf(callbackClass)
-            ) { _, method, args ->
-                when (method.name) {
-                    "onStatusUpdate" -> {
-                        val status = args[0] as Int
-                        val percent = args[1] as Float
-                        Log.d(TAG, "onStatusUpdate: status=$status, percent=$percent")
-                        cb.onStatusUpdate(status, percent)
-                    }
-                    "onPayloadApplicationComplete" -> {
-                        val errorCode = args[0] as Int
-                        Log.d(TAG, "onPayloadApplicationComplete: errorCode=$errorCode")
-                        cb.onPayloadApplicationComplete(errorCode)
-                    }
-                }
-                null
-            }
-
-            val method = engineCls.getMethod("bind", callbackClass)
-            method.invoke(eng, proxy)
-            Log.d(TAG, "bindListener: callback bound successfully")
-            return true
-        } catch (e: Exception) {
-            Log.e(TAG, "bindListener: failed: ${e.message}")
-            // 如果绑定失败，通过手动回调通知
-            // 但这里不立即回调，让 applyPayload 完成后通过异步方式通知
-            return false
+            val method = cls.getMethod("cancel")
+            method.invoke(eng)
+            Log.d(TAG, "cancel: update cancelled")
+        } catch (_: Exception) {
         }
     }
 
-    fun isBound(): Boolean = engine != null
+    /** 重置 update_engine 状态 */
+    fun resetStatus() {
+        try {
+            val service = getUpdateEngineService() ?: return
+            val cls = Class.forName("android.os.IUpdateEngine")
+            val stubClass = Class.forName("android.os.IUpdateEngine\$Stub")
+            val asInterface = stubClass.getMethod("asInterface", IBinder::class.java)
+            val tempEngine = asInterface.invoke(null, service)
+            val method = cls.getMethod("resetStatus")
+            method.invoke(tempEngine)
+            Log.d(TAG, "resetStatus: done")
+        } catch (e: Exception) {
+            Log.e(TAG, "resetStatus: failed: ${e.message}")
+        }
+    }
+
+    /** 检测是否有已完成的升级等待重启 */
+    fun checkPendingUpdate(): Boolean {
+        try {
+            val pendingVersion = com.example.firmwaremanagement.storage.PrefsManager.getPendingSlotVersion()
+            if (!pendingVersion.isNullOrEmpty()) {
+                Log.d(TAG, "checkPendingUpdate: PrefsManager has pending version=$pendingVersion")
+                return true
+            }
+        } catch (_: Exception) {
+        }
+
+        try {
+            val rt = Runtime.getRuntime()
+            val proc = rt.exec(arrayOf("update_engine_client", "--status"))
+            proc.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)
+            val output = proc.inputStream.bufferedReader().readText()
+            if (Regex("CURRENT_STATE[=: ]\\s*UPDATED_NEED_REBOOT").containsMatchIn(output)) {
+                Log.d(TAG, "checkPendingUpdate: UPDATED_NEED_REBOOT detected via command")
+                return true
+            }
+        } catch (_: Exception) {
+        }
+
+        return false
+    }
+
+    fun getProgress(): Float {
+        try {
+            val eng = engine
+            val cls = engineClass
+            if (eng != null && cls != null) {
+                try {
+                    val method = cls.getMethod("getProgress")
+                    val value = method.invoke(eng) as Float
+                    if (value >= 0f) return value
+                } catch (_: NoSuchMethodException) {
+                }
+            }
+        } catch (_: Exception) {
+        }
+
+        try {
+            for (arg in arrayOf("--status", "--progress")) {
+                try {
+                    val rt = Runtime.getRuntime()
+                    val proc = rt.exec(arrayOf("update_engine_client", arg))
+                    proc.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)
+                    val output = proc.inputStream.bufferedReader().readText()
+                    val progressMatch = Regex("(?:PROGRESS|progress)[=: ]\\s*([\\d.]+)").find(output)
+                    if (progressMatch != null) {
+                        val value = progressMatch.groupValues[1].toFloatOrNull() ?: -1f
+                        if (value >= 0f) return value
+                    }
+                } catch (_: Exception) {
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return -1f
+    }
+
+    fun getLastResultCode(): Int {
+        try {
+            val eng = engine
+            val cls = engineClass
+            if (eng != null && cls != null) {
+                try {
+                    val method = cls.getMethod("getResult", Int::class.javaPrimitiveType)
+                    val value = method.invoke(eng, 0) as Int
+                    return value
+                } catch (_: NoSuchMethodException) {
+                }
+            }
+        } catch (_: Exception) {
+        }
+
+        try {
+            val rt = Runtime.getRuntime()
+            val proc = rt.exec(arrayOf("update_engine_client", "--status"))
+            proc.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)
+            val output = proc.inputStream.bufferedReader().readText()
+            val exitCode = Regex("LAST_ATTEMPT_ERROR[=: ]\\s*(\\d+)").find(output)
+            if (exitCode != null) {
+                return exitCode.groupValues[1].toIntOrNull() ?: -1
+            }
+            if (Regex("CURRENT_STATE[=: ]\\s*UPDATED_NEED_REBOOT").containsMatchIn(output)) {
+                return 0
+            }
+        } catch (_: Exception) {
+        }
+        return -1
+    }
+
+    // ========== 内部方法 ==========
+
+    /** 从类读取静态 int 字段 */
+    private fun readStaticIntField(cls: Class<*>, fieldName: String): Int {
+        val field = cls.getDeclaredField(fieldName)
+        field.isAccessible = true
+        return field.getInt(null)
+    }
+
+    /** 从类读取静态 String 字段 */
+    private fun readStaticStringField(cls: Class<*>, fieldName: String): String? {
+        return try {
+            val field = cls.getDeclaredField(fieldName)
+            field.isAccessible = true
+            field.get(null) as? String
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private val SERVICE_NAMES = arrayOf(
+        "android.os.UpdateEngineService",   // Rockchip Android 14
+        "update_engine",                     // 标准 AOSP
+    )
+
+    private fun getUpdateEngineService(): IBinder? {
+        return try {
+            val cls = Class.forName("android.os.ServiceManager")
+            val method = cls.getMethod("getService", String::class.java)
+            for (name in SERVICE_NAMES) {
+                val service = method.invoke(null, name) as? IBinder
+                if (service != null) {
+                    Log.d(TAG, "getUpdateEngineService: found service with name '$name'")
+                    return service
+                }
+            }
+            Log.e(TAG, "getUpdateEngineService: none of ${SERVICE_NAMES.contentToString()} found")
+            null
+        } catch (e: Exception) {
+            Log.e(TAG, "getUpdateEngineService: failed: ${e.message}")
+            null
+        }
+    }
+
+    /** 诊断设备上 update_engine 相关的类和服务的可用性。 */
+    fun diagnose() {
+        Log.w(TAG, "========== update_engine DIAGNOSE START ==========")
+
+        // 1. ServiceManager
+        try {
+            val sm = Class.forName("android.os.ServiceManager")
+            Log.d(TAG, "diag: [OK] ServiceManager class found")
+            try {
+                val listMethod = sm.getMethod("listServices")
+                @Suppress("UNCHECKED_CAST")
+                val services = listMethod.invoke(null) as? Array<String>
+                val updateServices = services?.filter { it.contains("update", ignoreCase = true) }
+                Log.d(TAG, "diag: update-related services: $updateServices")
+                if (!updateServices.isNullOrEmpty()) {
+                    val getService = sm.getMethod("getService", String::class.java)
+                    for (name in updateServices) {
+                        val svc = getService.invoke(null, name)
+                        Log.d(TAG, "diag: service '$name' -> ${if (svc != null) "available" else "null"}")
+                    }
+                } else {
+                    Log.w(TAG, "diag: [WARN] No update-related service found!")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "diag: listServices failed: ${e.message}")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "diag: [FAIL] ServiceManager class not found: ${e.message}")
+        }
+
+        // 2. IUpdateEngine
+        try {
+            Class.forName("android.os.IUpdateEngine")
+            Log.d(TAG, "diag: [OK] IUpdateEngine class found")
+        } catch (e: Exception) {
+            Log.e(TAG, "diag: [FAIL] IUpdateEngine: ${e.message}")
+        }
+
+        // 3. IUpdateEngine$Stub
+        try {
+            Class.forName("android.os.IUpdateEngine\$Stub")
+            Log.d(TAG, "diag: [OK] IUpdateEngine\$Stub class found")
+        } catch (e: Exception) {
+            Log.e(TAG, "diag: [FAIL] IUpdateEngine\$Stub: ${e.message}")
+        }
+
+        // 4. IUpdateEngineCallback & Stub
+        try {
+            val cb = Class.forName("android.os.IUpdateEngineCallback")
+            Log.d(TAG, "diag: [OK] IUpdateEngineCallback, isInterface=${cb.isInterface}")
+        } catch (e: Exception) {
+            Log.e(TAG, "diag: [FAIL] IUpdateEngineCallback: ${e.message}")
+        }
+        try {
+            val stub = Class.forName("android.os.IUpdateEngineCallback\$Stub")
+            Log.d(TAG, "diag: [OK] IUpdateEngineCallback\$Stub found")
+            // 读取交易码
+            for (name in arrayOf("TRANSACTION_onStatusUpdate", "TRANSACTION_onPayloadApplicationComplete")) {
+                try {
+                    val field = stub.getDeclaredField(name)
+                    field.isAccessible = true
+                    Log.d(TAG, "diag: $name = ${field.getInt(null)}")
+                } catch (e: Exception) {
+                    Log.w(TAG, "diag: $name not found: ${e.message}")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "diag: [FAIL] IUpdateEngineCallback\$Stub: ${e.message}")
+        }
+
+        // 5. update_engine_client
+        try {
+            val proc = Runtime.getRuntime().exec(arrayOf("update_engine_client", "--status"))
+            proc.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)
+            val output = proc.inputStream.bufferedReader().readText()
+            Log.d(TAG, "diag: [OK] update_engine_client exit=${proc.exitValue()}, output=${output.take(500)}")
+        } catch (e: Exception) {
+            Log.w(TAG, "diag: update_engine_client failed: ${e.message}")
+        }
+
+        // 6. service list
+        try {
+            val proc = Runtime.getRuntime().exec(arrayOf("service", "list"))
+            proc.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)
+            val output = proc.inputStream.bufferedReader().readText()
+            val engineLines = output.lines().filter { it.contains("update", ignoreCase = true) }
+            Log.d(TAG, "diag: 'service list' update entries: ${engineLines.toList()}")
+        } catch (e: Exception) {
+            Log.w(TAG, "diag: 'service list' failed: ${e.message}")
+        }
+
+        Log.w(TAG, "========== update_engine DIAGNOSE END ==========")
+    }
 }

@@ -103,6 +103,7 @@ class MainActivity : ComponentActivity() {
     private var pendingUpdateInfo by mutableStateOf<UpdateInfo?>(null)
     private var resumeRefreshKey by mutableStateOf(0)  // 用于在onResume时刷新UI
     private var downloadProgress by mutableFloatStateOf(0f)  // 下载进度 0.0~1.0
+    private var applyProgress by mutableFloatStateOf(0f)     // 升级进度 0.0~1.0
 
     // 下载事件广播接收器
     private val downloadEventReceiver = object : BroadcastReceiver() {
@@ -168,8 +169,28 @@ class MainActivity : ComponentActivity() {
                     onDismissNewUpdate = { showNewUpdateDialog = false },
                     pendingUpdateInfo = pendingUpdateInfo,
                     resumeRefreshKey = resumeRefreshKey,
-                    downloadProgress = downloadProgress
+                    downloadProgress = downloadProgress,
+                    applyProgress = applyProgress
                 )
+            }
+        }
+
+        checkPendingUpdateOnStart()
+    }
+
+    // 启动时检测是否有已完成的升级等待重启
+    private fun checkPendingUpdateOnStart() {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                if (UpdateEngineWrapper.checkPendingUpdate()) {
+                    Log.d(TAG, "onCreate: pending update detected, showing reboot prompt")
+                    withContext(Dispatchers.Main) {
+                        stage = Stage.REBOOT_PENDING
+                        showRebootDialogFlag = true
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "onCreate: checkPendingUpdate failed: ${e.message}")
             }
         }
     }
@@ -257,6 +278,7 @@ class MainActivity : ComponentActivity() {
             
             try {
                 stage = Stage.PREPARING
+                applyProgress = 0f
                 
                 // 从 ZIP 中提取 payload.bin
                 val payloadInfo = withContext(Dispatchers.IO) {
@@ -275,6 +297,14 @@ class MainActivity : ComponentActivity() {
                 stage = Stage.APPLYING
                 
                 val success = UpdateEngineWrapper.bind(object : UpdateEngineCallbackAdapter() {
+                    override fun onStatusUpdate(status: Int, percent: Float) {
+                        // AIDL 回调的 percentage 是 0.0~1.0 的浮点数
+                        // 兼容某些设备可能返回 0~100 的情况
+                        val normalized = if (percent > 1f) percent / 100f else percent
+                        applyProgress = normalized.coerceIn(0f, 1f)
+                        Log.d(TAG, "applyPayloadAfterDownload: onStatusUpdate status=$status, progress=$applyProgress")
+                    }
+
                     override fun onPayloadApplicationComplete(errorCode: Int) {
                         CoroutineScope(Dispatchers.Main).launch {
                             // 清理提取的 payload 文件
@@ -293,15 +323,17 @@ class MainActivity : ComponentActivity() {
                 })
                 
                 if (success) {
-                    Log.d(TAG, "applyPayloadAfterDownload: UpdateEngine bound, registering listener")
-                    UpdateEngineWrapper.bindListener()
+                    Log.d(TAG, "applyPayloadAfterDownload: UpdateEngine bound")
                     UpdateEngineWrapper.applyPayload(
                         "file://${payloadInfo.payloadFile}",
                         0,
                         payloadInfo.size,
                         payloadInfo.headers
                     )
-                    Log.d(TAG, "applyPayloadAfterDownload: applyPayload called, waiting for callback")
+                    Log.d(TAG, "applyPayloadAfterDownload: applyPayload called, starting polling")
+
+                    // 轮询检测更新进度（防止回调没收到导致卡死）
+                    startApplyPolling()
                 } else {
                     Log.e(TAG, "applyPayloadAfterDownload: failed to bind UpdateEngine")
                     ZipPayloadExtractor.cleanup(this@MainActivity)
@@ -312,6 +344,61 @@ class MainActivity : ComponentActivity() {
                 ZipPayloadExtractor.cleanup(this@MainActivity)
                 stage = Stage.ERROR
                 errorMessage = "准备升级失败: ${e.message}"
+            }
+        }
+    }
+
+    /**
+     * 轮询 update_engine 进度，防止 Proxy 回调未注册导致界面卡死
+     */
+    private fun startApplyPolling() {
+        Log.d(TAG, "startApplyPolling: begin polling update_engine progress")
+        CoroutineScope(Dispatchers.Main).launch {
+            var elapsed = 0L
+            val maxPollTime = 120_000L  // 最大轮询120秒
+            val pollInterval = 3_000L   // 每3秒轮询一次
+
+            while (elapsed < maxPollTime) {
+                delay(pollInterval)
+                elapsed += pollInterval
+
+                // 如果已经通过回调切换了状态，停止轮询
+                if (stage != Stage.APPLYING) {
+                    Log.d(TAG, "startApplyPolling: stage changed to $stage, stopping polling")
+                    return@launch
+                }
+
+                // 轮询进度
+                val progress = UpdateEngineWrapper.getProgress()
+                if (progress >= 0f) {
+                    applyProgress = progress.coerceIn(0f, 1f)
+                    Log.d(TAG, "startApplyPolling: polled progress=$progress")
+                }
+
+                // 轮询结果码
+                val resultCode = UpdateEngineWrapper.getLastResultCode()
+                if (resultCode >= 0) {
+                    Log.d(TAG, "startApplyPolling: got resultCode=$resultCode")
+                    ZipPayloadExtractor.cleanup(this@MainActivity)
+                    if (resultCode == 0) {
+                        PrefsManager.setPendingSlotVersion(pendingVersionForSlot)
+                        stage = Stage.REBOOT_PENDING
+                        showRebootDialogFlag = true
+                    } else {
+                        stage = Stage.ERROR
+                        errorMessage = "升级失败，错误码: $resultCode"
+                    }
+                    return@launch
+                }
+            }
+
+            // 超时仍未完成，默认显示重启提示
+            if (stage == Stage.APPLYING) {
+                Log.w(TAG, "startApplyPolling: timeout, assuming update completed")
+                ZipPayloadExtractor.cleanup(this@MainActivity)
+                PrefsManager.setPendingSlotVersion(pendingVersionForSlot)
+                stage = Stage.REBOOT_PENDING
+                showRebootDialogFlag = true
             }
         }
     }
@@ -385,7 +472,8 @@ fun MainScreen(
     onDismissNewUpdate: () -> Unit,
     pendingUpdateInfo: UpdateInfo?,
     resumeRefreshKey: Int = 0,
-    downloadProgress: Float = 0f
+    downloadProgress: Float = 0f,
+    applyProgress: Float = 0f
 ) {
     val context = LocalContext.current
     var serverUrl by mutableStateOf(PrefsManager.getServerBaseUrl() ?: "")
@@ -402,12 +490,6 @@ fun MainScreen(
         if (stage == Stage.IDLE || stage == Stage.CHECK_PREPARE) {
             serverUrl = PrefsManager.getServerBaseUrl() ?: ""
             currentVersion = PrefsManager.getCurrentVersion()
-        }
-    }
-
-    LaunchedEffect(stage) {
-        if (stage == Stage.DOWNLOADED) {
-            onApplyPayload()
         }
     }
 
@@ -463,10 +545,13 @@ fun MainScreen(
                 )
                 Stage.CHECK_PREPARE -> LoadingScreen("正在检查更新...")
                 Stage.DOWNLOADING -> DownloadScreen(progress = downloadProgress)
-                Stage.DOWNLOADED -> LoadingScreen("下载完成，准备中...")
+                Stage.DOWNLOADED -> DownloadedScreen(onApplyPayload = { onApplyPayload() })
                 Stage.PREPARING -> LoadingScreen("准备中...")
-                Stage.APPLYING -> ApplyingScreen(progress = downloadProgress)
-                Stage.REBOOT_PENDING -> RebootPendingScreen(onReboot = onReboot)
+                Stage.APPLYING -> ApplyingScreen(progress = applyProgress)
+                Stage.REBOOT_PENDING -> RebootPendingScreen(
+                    onReboot = onReboot,
+                    onDismiss = { onStageChange(Stage.IDLE) }
+                )
                 Stage.ERROR -> ErrorScreen(
                     message = errorMessage ?: "未知错误",
                     onDismiss = { onStageChange(Stage.IDLE) }
@@ -614,6 +699,41 @@ fun InfoRow(
 }
 
 @Composable
+fun DownloadedScreen(onApplyPayload: () -> Unit) {
+    Column(
+        modifier = Modifier.fillMaxSize(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text(
+            text = "下载完成",
+            color = WhiteText,
+            fontSize = 18.sp,
+            fontWeight = FontWeight.Medium
+        )
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Text(
+            text = "固件已下载，点击下方按钮开始升级",
+            color = WhiteText.copy(alpha = 0.7f),
+            fontSize = 14.sp
+        )
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        Button(
+            onClick = onApplyPayload,
+            colors = ButtonDefaults.buttonColors(containerColor = TechBlue),
+            shape = RoundedCornerShape(8.dp),
+            modifier = Modifier.width(200.dp).height(48.dp)
+        ) {
+            Text("立即更新", color = WhiteText, fontSize = 16.sp)
+        }
+    }
+}
+
+@Composable
 fun LoadingScreen(message: String) {
     Column(
         modifier = Modifier.fillMaxSize(),
@@ -646,14 +766,30 @@ fun DownloadScreen(progress: Float) {
 
         Spacer(modifier = Modifier.height(24.dp))
 
-        LinearProgressIndicator(
-            progress = { progress },
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(8.dp),
-            color = TechBlue,
-            trackColor = Color(0xFF3D3D3D)
-        )
+        if (progress > 0f) {
+            LinearProgressIndicator(
+                progress = { progress },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(8.dp),
+                color = TechBlue,
+                trackColor = Color(0xFF3D3D3D)
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = "${(progress * 100).toInt()}%",
+                color = WhiteText.copy(alpha = 0.7f),
+                fontSize = 13.sp
+            )
+        } else {
+            LinearProgressIndicator(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(8.dp),
+                color = TechBlue,
+                trackColor = Color(0xFF3D3D3D)
+            )
+        }
 
         Spacer(modifier = Modifier.height(16.dp))
 
@@ -673,10 +809,22 @@ fun ApplyingScreen(progress: Float) {
         verticalArrangement = Arrangement.Center
     ) {
         Text(
-            text = "正在应用更新...",
+            text = "正在升级固件...",
             color = WhiteText,
             fontSize = 18.sp,
             fontWeight = FontWeight.Medium
+        )
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Text(
+            text = when {
+                progress <= 0f -> "准备中，请稍候..."
+                progress < 1f -> "正在写入固件..."
+                else -> "写入完成，正在验证..."
+            },
+            color = WhiteText.copy(alpha = 0.7f),
+            fontSize = 14.sp
         )
 
         Spacer(modifier = Modifier.height(24.dp))
@@ -701,7 +849,7 @@ fun ApplyingScreen(progress: Float) {
 }
 
 @Composable
-fun RebootPendingScreen(onReboot: () -> Unit) {
+fun RebootPendingScreen(onReboot: () -> Unit, onDismiss: () -> Unit) {
     Column(
         modifier = Modifier.fillMaxSize(),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -727,6 +875,12 @@ fun RebootPendingScreen(onReboot: () -> Unit) {
             shape = RoundedCornerShape(8.dp)
         ) {
             Text("立即重启", fontSize = 18.sp, color = WhiteText)
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        TextButton(onClick = onDismiss) {
+            Text("稍后重启", color = Color.Gray)
         }
     }
 }
