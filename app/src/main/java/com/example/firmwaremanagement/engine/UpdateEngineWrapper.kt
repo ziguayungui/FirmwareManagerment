@@ -244,6 +244,29 @@ object UpdateEngineWrapper {
         }
     }
 
+    /**
+     * 设置重启后切换到新分区（A/B slot 切换）。
+     * 必须在 applyPayload 成功后调用，否则重启后仍从旧分区启动。
+     * @param metadataFilename update_engine 元数据文件路径（通常是 payload 所在目录）
+     */
+    fun setShouldSwitchSlotOnReboot(metadataFilename: String) {
+        try {
+            val service = getUpdateEngineService() ?: run {
+                Log.e(TAG, "setShouldSwitchSlotOnReboot: service not available")
+                return
+            }
+            val cls = Class.forName("android.os.IUpdateEngine")
+            val stubClass = Class.forName("android.os.IUpdateEngine\$Stub")
+            val asInterface = stubClass.getMethod("asInterface", IBinder::class.java)
+            val tempEngine = asInterface.invoke(null, service)
+            val method = cls.getMethod("setShouldSwitchSlotOnReboot", String::class.java)
+            method.invoke(tempEngine, metadataFilename)
+            Log.d(TAG, "setShouldSwitchSlotOnReboot: slot switch flag set, metadata=$metadataFilename")
+        } catch (e: Exception) {
+            Log.e(TAG, "setShouldSwitchSlotOnReboot: failed: ${e.message}")
+        }
+    }
+
     /** 检测是否有已完成的升级等待重启 */
     fun checkPendingUpdate(): Boolean {
         try {
@@ -457,6 +480,12 @@ object UpdateEngineWrapper {
             proc.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)
             val output = proc.inputStream.bufferedReader().readText()
             Log.d(TAG, "diag: [OK] update_engine_client exit=${proc.exitValue()}, output=${output.take(500)}")
+            val switchFlag = Regex("SWITCH_SLOT_ON_REBOOT[=: ]\\s*(\\w+)").find(output)
+            if (switchFlag != null) {
+                Log.d(TAG, "diag: SWITCH_SLOT_ON_REBOOT = ${switchFlag.groupValues[1]}")
+            } else {
+                Log.d(TAG, "diag: SWITCH_SLOT_ON_REBOOT flag not found in output")
+            }
         } catch (e: Exception) {
             Log.w(TAG, "diag: update_engine_client failed: ${e.message}")
         }

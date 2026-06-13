@@ -98,6 +98,7 @@ class MainActivity : ComponentActivity() {
     private var stage by mutableStateOf(Stage.IDLE)
     private var errorMessage by mutableStateOf<String?>(null)
     private var pendingVersionForSlot by mutableStateOf("")
+    private var pendingPayloadPath by mutableStateOf("")     // 记录 payload 路径，供轮询路径调用 setShouldSwitchSlotOnReboot
     private var showNoUpdateDialog by mutableStateOf(false)
     private var showNewUpdateDialog by mutableStateOf(false)
     private var pendingUpdateInfo by mutableStateOf<UpdateInfo?>(null)
@@ -296,6 +297,7 @@ class MainActivity : ComponentActivity() {
                 val payloadInfo = withContext(Dispatchers.IO) {
                     ZipPayloadExtractor.extract(this@MainActivity, targetFile)
                 }
+                pendingPayloadPath = payloadInfo.payloadFile  // 记录路径，供轮询路径调用 setShouldSwitchSlotOnReboot
                 
                 // 提取完成后删除原 ZIP 文件，释放空间
                 withContext(Dispatchers.IO) {
@@ -324,10 +326,11 @@ class MainActivity : ComponentActivity() {
 
                     override fun onPayloadApplicationComplete(errorCode: Int) {
                         CoroutineScope(Dispatchers.Main).launch {
-                            // 清理提取的 payload 文件
-                            ZipPayloadExtractor.cleanup(this@MainActivity)
-                            
                             if (errorCode == 0) {
+                                // 通知 update_engine/bootloader：重启后切换到新分区
+                                UpdateEngineWrapper.setShouldSwitchSlotOnReboot(payloadInfo.payloadFile)
+                                Log.d(TAG, "applyPayloadAfterDownload: setShouldSwitchSlotOnReboot called")
+
                                 PrefsManager.setPendingSlotVersion(pendingVersionForSlot)
                                 Log.d(TAG, "stage -> REBOOT_PENDING (callback errorCode=0)")
                                 stage = Stage.REBOOT_PENDING
@@ -337,6 +340,9 @@ class MainActivity : ComponentActivity() {
                                 stage = Stage.ERROR
                                 errorMessage = "升级失败，错误码: $errorCode"
                             }
+
+                            // 清理提取的 payload 文件（在 setShouldSwitchSlotOnReboot 之后）
+                            ZipPayloadExtractor.cleanup(this@MainActivity)
                         }
                     }
                 })
@@ -406,8 +412,8 @@ class MainActivity : ComponentActivity() {
                 val resultCode = UpdateEngineWrapper.getLastResultCode()
                 if (resultCode >= 0) {
                     Log.d(TAG, "startApplyPolling: got resultCode=$resultCode")
-                    ZipPayloadExtractor.cleanup(this@MainActivity)
                     if (resultCode == 0) {
+                        UpdateEngineWrapper.setShouldSwitchSlotOnReboot(pendingPayloadPath)
                         PrefsManager.setPendingSlotVersion(pendingVersionForSlot)
                         Log.d(TAG, "stage -> REBOOT_PENDING (poll resultCode=0)")
                         stage = Stage.REBOOT_PENDING
@@ -417,6 +423,7 @@ class MainActivity : ComponentActivity() {
                         stage = Stage.ERROR
                         errorMessage = "升级失败，错误码: $resultCode"
                     }
+                    ZipPayloadExtractor.cleanup(this@MainActivity)
                     return@launch
                 }
             }
@@ -424,6 +431,7 @@ class MainActivity : ComponentActivity() {
             // 超时仍未完成，默认显示重启提示
             if (stage == Stage.APPLYING) {
                 Log.w(TAG, "startApplyPolling: timeout, assuming update completed")
+                UpdateEngineWrapper.setShouldSwitchSlotOnReboot(pendingPayloadPath)
                 ZipPayloadExtractor.cleanup(this@MainActivity)
                 PrefsManager.setPendingSlotVersion(pendingVersionForSlot)
                 Log.d(TAG, "stage -> REBOOT_PENDING (poll timeout)")
