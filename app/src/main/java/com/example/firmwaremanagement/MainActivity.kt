@@ -104,6 +104,7 @@ class MainActivity : ComponentActivity() {
     private var resumeRefreshKey by mutableStateOf(0)  // 用于在onResume时刷新UI
     private var downloadProgress by mutableFloatStateOf(0f)  // 下载进度 0.0~1.0
     private var applyProgress by mutableFloatStateOf(0f)     // 升级进度 0.0~1.0
+    var applyStatusLabel by mutableStateOf("")           // 当前升级阶段描述（public for Composable access）
 
     // 下载事件广播接收器
     private val downloadEventReceiver = object : BroadcastReceiver() {
@@ -119,9 +120,11 @@ class MainActivity : ComponentActivity() {
                 DownloadService.ACTION_DOWNLOAD_ERROR -> {
                     val errorMsg = intent.getStringExtra(DownloadService.EXTRA_ERROR_MESSAGE) ?: "下载失败"
                     errorMessage = errorMsg
+                    Log.w(TAG, "stage -> ERROR (download): $errorMsg")
                     stage = Stage.ERROR
                 }
                 DownloadService.ACTION_DOWNLOAD_COMPLETE -> {
+                    Log.d(TAG, "stage -> DOWNLOADED")
                     stage = Stage.DOWNLOADED
                 }
             }
@@ -170,7 +173,8 @@ class MainActivity : ComponentActivity() {
                     pendingUpdateInfo = pendingUpdateInfo,
                     resumeRefreshKey = resumeRefreshKey,
                     downloadProgress = downloadProgress,
-                    applyProgress = applyProgress
+                    applyProgress = applyProgress,
+                    applyStatusLabel = applyStatusLabel
                 )
             }
         }
@@ -185,6 +189,7 @@ class MainActivity : ComponentActivity() {
                 if (UpdateEngineWrapper.checkPendingUpdate()) {
                     Log.d(TAG, "onCreate: pending update detected, showing reboot prompt")
                     withContext(Dispatchers.Main) {
+                        Log.d(TAG, "stage -> REBOOT_PENDING (checkPendingOnStart)")
                         stage = Stage.REBOOT_PENDING
                         showRebootDialogFlag = true
                     }
@@ -210,10 +215,12 @@ class MainActivity : ComponentActivity() {
             val serverUrl = PrefsManager.getServerBaseUrl()
             if (serverUrl.isNullOrBlank()) {
                 errorMessage = "请先配置服务器地址"
+                Log.w(TAG, "stage -> ERROR: no server URL")
                 stage = Stage.ERROR
                 return@launch
             }
 
+            Log.d(TAG, "stage -> CHECK_PREPARE")
             stage = Stage.CHECK_PREPARE
             delay(500)
 
@@ -224,15 +231,18 @@ class MainActivity : ComponentActivity() {
             when (result) {
                 UpdateCheckResult.NoUpdate -> {
                     showNoUpdateDialog = true
+                    Log.d(TAG, "stage -> IDLE (no update)")
                     stage = Stage.IDLE
                 }
                 is UpdateCheckResult.NewUpdate -> {
                     pendingUpdateInfo = result.info
                     showNewUpdateDialog = true
+                    Log.d(TAG, "stage -> IDLE (new update found)")
                     stage = Stage.IDLE
                 }
                 is UpdateCheckResult.Error -> {
                     errorMessage = result.message
+                    Log.w(TAG, "stage -> ERROR (check): ${result.message}")
                     stage = Stage.ERROR
                 }
             }
@@ -246,6 +256,7 @@ class MainActivity : ComponentActivity() {
         val downloadUrl = "${PrefsManager.getServerBaseUrl()}/${info.filename}"
         
         pendingVersionForSlot = info.version
+        Log.d(TAG, "stage -> DOWNLOADING")
         stage = Stage.DOWNLOADING
         
         // 通过 Intent 启动 DownloadService，传递下载参数
@@ -277,6 +288,7 @@ class MainActivity : ComponentActivity() {
             val targetFile = OtaPathProvider.getTargetFile(this@MainActivity).absolutePath
             
             try {
+                Log.d(TAG, "stage -> PREPARING")
                 stage = Stage.PREPARING
                 applyProgress = 0f
                 
@@ -294,15 +306,20 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 
+                Log.d(TAG, "stage -> APPLYING")
                 stage = Stage.APPLYING
-                
+                applyStatusLabel = ""
+
                 val success = UpdateEngineWrapper.bind(object : UpdateEngineCallbackAdapter() {
                     override fun onStatusUpdate(status: Int, percent: Float) {
-                        // AIDL 回调的 percentage 是 0.0~1.0 的浮点数
-                        // 兼容某些设备可能返回 0~100 的情况
-                        val normalized = if (percent > 1f) percent / 100f else percent
-                        applyProgress = normalized.coerceIn(0f, 1f)
-                        Log.d(TAG, "applyPayloadAfterDownload: onStatusUpdate status=$status, progress=$applyProgress")
+                        CoroutineScope(Dispatchers.Main).launch {
+                            // AIDL 回调的 percentage 是 0.0~1.0 的浮点数
+                            // 兼容某些设备可能返回 0~100 的情况
+                            val normalized = if (percent > 1f) percent / 100f else percent
+                            applyProgress = normalized.coerceIn(0f, 1f)
+                            applyStatusLabel = UpdateEngineWrapper.describeStatus(status)
+                            Log.d(TAG, "applyPayloadAfterDownload: onStatusUpdate status=$status ($applyStatusLabel), progress=$applyProgress")
+                        }
                     }
 
                     override fun onPayloadApplicationComplete(errorCode: Int) {
@@ -312,9 +329,11 @@ class MainActivity : ComponentActivity() {
                             
                             if (errorCode == 0) {
                                 PrefsManager.setPendingSlotVersion(pendingVersionForSlot)
+                                Log.d(TAG, "stage -> REBOOT_PENDING (callback errorCode=0)")
                                 stage = Stage.REBOOT_PENDING
                                 showRebootDialogFlag = true
                             } else {
+                                Log.w(TAG, "stage -> ERROR (callback errorCode=$errorCode)")
                                 stage = Stage.ERROR
                                 errorMessage = "升级失败，错误码: $errorCode"
                             }
@@ -324,6 +343,11 @@ class MainActivity : ComponentActivity() {
                 
                 if (success) {
                     Log.d(TAG, "applyPayloadAfterDownload: UpdateEngine bound")
+
+                    // 重置引擎状态，清除上一次升级的残留状态（如 UPDATED_NEED_REBOOT）
+                    UpdateEngineWrapper.resetStatus()
+                    Log.d(TAG, "applyPayloadAfterDownload: resetStatus done")
+
                     UpdateEngineWrapper.applyPayload(
                         "file://${payloadInfo.payloadFile}",
                         0,
@@ -337,11 +361,14 @@ class MainActivity : ComponentActivity() {
                 } else {
                     Log.e(TAG, "applyPayloadAfterDownload: failed to bind UpdateEngine")
                     ZipPayloadExtractor.cleanup(this@MainActivity)
+                    Log.w(TAG, "stage -> ERROR (bind failed)")
                     stage = Stage.ERROR
                     errorMessage = "设备不支持OTA升级"
                 }
             } catch (e: Exception) {
+                Log.e(TAG, "applyPayloadAfterDownload: exception: ${e.message}", e)
                 ZipPayloadExtractor.cleanup(this@MainActivity)
+                Log.w(TAG, "stage -> ERROR (exception: ${e.message})")
                 stage = Stage.ERROR
                 errorMessage = "准备升级失败: ${e.message}"
             }
@@ -382,9 +409,11 @@ class MainActivity : ComponentActivity() {
                     ZipPayloadExtractor.cleanup(this@MainActivity)
                     if (resultCode == 0) {
                         PrefsManager.setPendingSlotVersion(pendingVersionForSlot)
+                        Log.d(TAG, "stage -> REBOOT_PENDING (poll resultCode=0)")
                         stage = Stage.REBOOT_PENDING
                         showRebootDialogFlag = true
                     } else {
+                        Log.w(TAG, "stage -> ERROR (poll resultCode=$resultCode)")
                         stage = Stage.ERROR
                         errorMessage = "升级失败，错误码: $resultCode"
                     }
@@ -397,6 +426,7 @@ class MainActivity : ComponentActivity() {
                 Log.w(TAG, "startApplyPolling: timeout, assuming update completed")
                 ZipPayloadExtractor.cleanup(this@MainActivity)
                 PrefsManager.setPendingSlotVersion(pendingVersionForSlot)
+                Log.d(TAG, "stage -> REBOOT_PENDING (poll timeout)")
                 stage = Stage.REBOOT_PENDING
                 showRebootDialogFlag = true
             }
@@ -443,6 +473,7 @@ class MainActivity : ComponentActivity() {
         stopService(stopIntent)
         // 清理任务状态
         TaskStateManager.clearTaskState(this)
+        Log.d(TAG, "stage -> IDLE (onDestroy)")
         stage = Stage.IDLE
         errorMessage = null
         checkUpdateJob?.cancel()
@@ -473,7 +504,8 @@ fun MainScreen(
     pendingUpdateInfo: UpdateInfo?,
     resumeRefreshKey: Int = 0,
     downloadProgress: Float = 0f,
-    applyProgress: Float = 0f
+    applyProgress: Float = 0f,
+    applyStatusLabel: String = ""
 ) {
     val context = LocalContext.current
     var serverUrl by mutableStateOf(PrefsManager.getServerBaseUrl() ?: "")
@@ -547,7 +579,7 @@ fun MainScreen(
                 Stage.DOWNLOADING -> DownloadScreen(progress = downloadProgress)
                 Stage.DOWNLOADED -> DownloadedScreen(onApplyPayload = { onApplyPayload() })
                 Stage.PREPARING -> LoadingScreen("准备中...")
-                Stage.APPLYING -> ApplyingScreen(progress = applyProgress)
+                Stage.APPLYING -> ApplyingScreen(progress = applyProgress, stageText = applyStatusLabel)
                 Stage.REBOOT_PENDING -> RebootPendingScreen(
                     onReboot = onReboot,
                     onDismiss = { onStageChange(Stage.IDLE) }
@@ -764,7 +796,20 @@ fun DownloadScreen(progress: Float) {
             fontWeight = FontWeight.Medium
         )
 
-        Spacer(modifier = Modifier.height(24.dp))
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Text(
+            text = when {
+                progress <= 0f -> "正在连接服务器..."
+                progress < 0.9f -> "正在下载数据..."
+                else -> "下载即将完成..."
+            },
+            color = TechBlue,
+            fontSize = 15.sp,
+            fontWeight = FontWeight.Medium
+        )
+
+        Spacer(modifier = Modifier.height(16.dp))
 
         if (progress > 0f) {
             LinearProgressIndicator(
@@ -802,7 +847,7 @@ fun DownloadScreen(progress: Float) {
 }
 
 @Composable
-fun ApplyingScreen(progress: Float) {
+fun ApplyingScreen(progress: Float, stageText: String = "") {
     Column(
         modifier = Modifier.fillMaxSize(),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -818,13 +863,16 @@ fun ApplyingScreen(progress: Float) {
         Spacer(modifier = Modifier.height(8.dp))
 
         Text(
-            text = when {
-                progress <= 0f -> "准备中，请稍候..."
-                progress < 1f -> "正在写入固件..."
-                else -> "写入完成，正在验证..."
+            text = stageText.ifEmpty {
+                when {
+                    progress <= 0f -> "准备中，请稍候..."
+                    progress < 1f -> "正在写入固件..."
+                    else -> "写入完成，正在验证..."
+                }
             },
-            color = WhiteText.copy(alpha = 0.7f),
-            fontSize = 14.sp
+            color = TechBlue,
+            fontSize = 15.sp,
+            fontWeight = FontWeight.Medium
         )
 
         Spacer(modifier = Modifier.height(24.dp))

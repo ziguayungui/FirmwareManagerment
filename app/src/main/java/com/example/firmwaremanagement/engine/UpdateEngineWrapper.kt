@@ -8,6 +8,52 @@ import android.util.Log
 object UpdateEngineWrapper {
 
     private const val TAG = "UpdateEngineWrapper"
+
+    // update_engine 状态码常量（对应 UpdateEngine.UpdateStatusConstants / IUpdateEngine）
+    const val STATUS_IDLE = 0
+    const val STATUS_CHECKING_FOR_UPDATE = 1
+    const val STATUS_UPDATE_AVAILABLE = 2
+    const val STATUS_DOWNLOADING = 3
+    const val STATUS_VERIFYING = 4
+    const val STATUS_FINALIZING = 5
+    const val STATUS_UPDATED_NEED_REBOOT = 6
+    const val STATUS_REPORTING_ERROR_EVENT = 7
+    const val STATUS_ATTEMPTING_ROLLBACK = 8
+    const val STATUS_DISABLED = 9
+    const val STATUS_CLEANUP_PREVIOUS_UPDATE = 11  // Rockchip Android 14
+
+    /** 将状态码转为可读的阶段描述 */
+    fun describeStatus(status: Int): String = when (status) {
+        STATUS_IDLE -> "引擎空闲"
+        STATUS_CHECKING_FOR_UPDATE -> "正在检查更新"
+        STATUS_UPDATE_AVAILABLE -> "检测到可用更新"
+        STATUS_DOWNLOADING -> "正在写入固件"            // update_engine 将 payload 写入分区
+        STATUS_VERIFYING -> "正在校验固件"
+        STATUS_FINALIZING -> "正在完成安装"              // 后处理：sync、slot 切换等
+        STATUS_UPDATED_NEED_REBOOT -> "安装完成，请重启系统"
+        STATUS_REPORTING_ERROR_EVENT -> "上报错误信息"
+        STATUS_ATTEMPTING_ROLLBACK -> "正在回滚"
+        STATUS_DISABLED -> "更新已禁用"
+        STATUS_CLEANUP_PREVIOUS_UPDATE -> "正在清理，请稍候"
+        else -> "状态码: $status"
+    }
+
+    /** 判断当前状态是否为升级进行中（返回 true 说明升级尚未结束） */
+    fun isApplying(status: Int): Boolean = status in listOf(
+        STATUS_IDLE, STATUS_CHECKING_FOR_UPDATE, STATUS_UPDATE_AVAILABLE,
+        STATUS_DOWNLOADING, STATUS_VERIFYING, STATUS_FINALIZING,
+        STATUS_CLEANUP_PREVIOUS_UPDATE
+    )
+
+    /** 判断当前状态是否表示升级已结束（成功或失败） */
+    fun isTerminal(status: Int): Boolean = when (status) {
+        STATUS_UPDATED_NEED_REBOOT -> true
+        STATUS_REPORTING_ERROR_EVENT -> true
+        STATUS_ATTEMPTING_ROLLBACK -> true
+        STATUS_DISABLED -> true
+        else -> false
+    }
+
     private var engine: Any? = null          // IUpdateEngine 代理对象
     private var engineClass: Class<*>? = null
     private var engineCallbackStubClass: Class<*>? = null
