@@ -244,13 +244,20 @@ object UpdateEngineWrapper {
         }
     }
 
+    private var switchSlotCalled = false  // 防止重复调用 setShouldSwitchSlotOnReboot
+
     /**
      * 设置重启后切换到新分区（A/B slot 切换）。
      * 必须在 applyPayload 成功后调用，否则重启后仍从旧分区启动。
      * 会尝试多种 metadata 路径，确保 Rockchip/标准 AOSP 都能生效。
+     * 同一会话内只执行一次，防止重复调用。
      * @param metadataFilename 首选路径（通常是 payload 所在文件路径）
      */
     fun setShouldSwitchSlotOnReboot(metadataFilename: String): Boolean {
+        if (switchSlotCalled) {
+            Log.d(TAG, "setShouldSwitchSlotOnReboot: already called in this session, skipping")
+            return true
+        }
         // 候选路径列表（按优先级排列）
         val candidatePaths = mutableListOf(metadataFilename)
 
@@ -307,6 +314,9 @@ object UpdateEngineWrapper {
         // 验证：重新读取 update_engine_client --status 确认 SWITCH_SLOT_ON_REBOOT 标志已置位
         verifySwitchSlotFlag()
 
+        if (success) {
+            switchSlotCalled = true
+        }
         return success
     }
 
@@ -346,15 +356,22 @@ object UpdateEngineWrapper {
                     Log.d(TAG, "tryBootctlSwitchSlot: mark-boot-successful done")
                 } catch (_: Exception) {}
 
-                // 验证 active slot 是否已变更
+                // 验证 active slot 是否已变更（使用多种方式）
                 Thread.sleep(300)
                 val verified = getCurrentSlot()
-                val verifyActive = try {
-                    val p = rt.exec(arrayOf("bootctl", "get-active-boot-slot"))
-                    p.waitFor(1, java.util.concurrent.TimeUnit.SECONDS)
-                    p.inputStream.bufferedReader().readText().trim()
-                } catch (_: Exception) { "" }
-                Log.d(TAG, "tryBootctlSwitchSlot: verified current=$verified, active=$verifyActive")
+                Log.d(TAG, "tryBootctlSwitchSlot: verified current=$verified")
+                // 验证目标 slot 是否标记为可启动
+                for (checkCmd in arrayOf(
+                    arrayOf("bootctl", "is-slot-bootable", target),
+                    arrayOf("bootctl", "is-slot-marked-successful", target),
+                )) {
+                    try {
+                        val p = rt.exec(checkCmd)
+                        p.waitFor(1, java.util.concurrent.TimeUnit.SECONDS)
+                        val out = p.inputStream.bufferedReader().readText().trim()
+                        Log.d(TAG, "tryBootctlSwitchSlot: ${checkCmd.contentToString()} -> $out (exit=${p.exitValue()})")
+                    } catch (_: Exception) {}
+                }
 
                 return true
             } else {
