@@ -328,8 +328,8 @@ class MainActivity : ComponentActivity() {
                         CoroutineScope(Dispatchers.Main).launch {
                             if (errorCode == 0) {
                                 // 通知 update_engine/bootloader：重启后切换到新分区
-                                UpdateEngineWrapper.setShouldSwitchSlotOnReboot(payloadInfo.payloadFile)
-                                Log.d(TAG, "applyPayloadAfterDownload: setShouldSwitchSlotOnReboot called")
+                                val switchOk = UpdateEngineWrapper.setShouldSwitchSlotOnReboot(payloadInfo.payloadFile)
+                                Log.d(TAG, "applyPayloadAfterDownload: setShouldSwitchSlotOnReboot result=$switchOk")
 
                                 PrefsManager.setPendingSlotVersion(pendingVersionForSlot)
                                 Log.d(TAG, "stage -> REBOOT_PENDING (callback errorCode=0)")
