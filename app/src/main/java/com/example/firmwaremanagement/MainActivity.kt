@@ -312,6 +312,18 @@ class MainActivity : ComponentActivity() {
                 stage = Stage.APPLYING
                 applyStatusLabel = ""
 
+                // ═══════════════════════════════════════════════════════
+                // [SEQ] 关键序列：resetStatus → bind → applyPayload → polling
+                // ═══════════════════════════════════════════════════════
+                Log.d(TAG, "========== [SEQ] applyPayloadAfterDownload: BEGIN upgrade sequence  thread=${Thread.currentThread().name} ==========")
+
+                // 在 bind 之前重置引擎状态，防止上一次升级的残留状态（如 UPDATED_NEED_REBOOT）
+                // 在 bind 回调注册时立即触发 onPayloadApplicationComplete，导致过早调用 setShouldSwitchSlotOnReboot
+                Log.d(TAG, "[SEQ] >>> about to call resetStatus()")
+                UpdateEngineWrapper.resetStatus()
+                Log.d(TAG, "[SEQ] <<< resetStatus() returned")
+
+                Log.d(TAG, "[SEQ] >>> about to call UpdateEngineWrapper.bind()")
                 val success = UpdateEngineWrapper.bind(object : UpdateEngineCallbackAdapter() {
                     override fun onStatusUpdate(status: Int, percent: Float) {
                         CoroutineScope(Dispatchers.Main).launch {
@@ -325,8 +337,19 @@ class MainActivity : ComponentActivity() {
                     }
 
                     override fun onPayloadApplicationComplete(errorCode: Int) {
+                        Log.d(TAG, "[SEQ] onPayloadApplicationComplete CALLBACK ENTER  errorCode=$errorCode  thread=${Thread.currentThread().name}")
                         CoroutineScope(Dispatchers.Main).launch {
+                            Log.d(TAG, "[SEQ] onPayloadApplicationComplete CoroutineScope.launch EXECUTING  thread=${Thread.currentThread().name}")
                             if (errorCode == 0) {
+                                // 防御性检查：仅在能确定引擎未处于终态时才拦截
+                                // getStatus() 在某些设备上可能返回 -1（AIDL 方法不存在），此时信任回调
+                                val engineStatus = UpdateEngineWrapper.getStatus()
+                                Log.d(TAG, "[SEQ] onPayloadApplicationComplete: engineStatus=$engineStatus")
+                                if (engineStatus >= 0 && !UpdateEngineWrapper.isTerminal(engineStatus)) {
+                                    Log.w(TAG, "[SEQ] onPayloadApplicationComplete IGNORED — engine status=$engineStatus (not terminal, likely stale callback from previous update)")
+                                    return@launch
+                                }
+                                Log.d(TAG, "[SEQ] onPayloadApplicationComplete: proceeding to setShouldSwitchSlotOnReboot (status=${if (engineStatus >= 0) engineStatus else "unknown"})")
                                 // 通知 update_engine/bootloader：重启后切换到新分区
                                 val switchOk = UpdateEngineWrapper.setShouldSwitchSlotOnReboot(payloadInfo.payloadFile)
                                 Log.d(TAG, "applyPayloadAfterDownload: setShouldSwitchSlotOnReboot result=$switchOk")
@@ -346,24 +369,25 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 })
-                
+                Log.d(TAG, "[SEQ] <<< UpdateEngineWrapper.bind() returned  success=$success")
+
                 if (success) {
                     Log.d(TAG, "applyPayloadAfterDownload: UpdateEngine bound")
 
-                    // 重置引擎状态，清除上一次升级的残留状态（如 UPDATED_NEED_REBOOT）
-                    UpdateEngineWrapper.resetStatus()
-                    Log.d(TAG, "applyPayloadAfterDownload: resetStatus done")
-
+                    Log.d(TAG, "[SEQ] >>> about to call applyPayload()")
                     UpdateEngineWrapper.applyPayload(
                         "file://${payloadInfo.payloadFile}",
                         0,
                         payloadInfo.size,
                         payloadInfo.headers
                     )
+                    Log.d(TAG, "[SEQ] <<< applyPayload() returned")
                     Log.d(TAG, "applyPayloadAfterDownload: applyPayload called, starting polling")
 
                     // 轮询检测更新进度（防止回调没收到导致卡死）
+                    Log.d(TAG, "[SEQ] >>> about to start polling")
                     startApplyPolling()
+                    Log.d(TAG, "[SEQ] <<< startApplyPolling() launched")
                 } else {
                     Log.e(TAG, "applyPayloadAfterDownload: failed to bind UpdateEngine")
                     ZipPayloadExtractor.cleanup(this@MainActivity)
@@ -371,6 +395,7 @@ class MainActivity : ComponentActivity() {
                     stage = Stage.ERROR
                     errorMessage = "设备不支持OTA升级"
                 }
+                Log.d(TAG, "========== [SEQ] applyPayloadAfterDownload: END upgrade sequence ==========")
             } catch (e: Exception) {
                 Log.e(TAG, "applyPayloadAfterDownload: exception: ${e.message}", e)
                 ZipPayloadExtractor.cleanup(this@MainActivity)
@@ -385,15 +410,23 @@ class MainActivity : ComponentActivity() {
      * 轮询 update_engine 进度，防止 Proxy 回调未注册导致界面卡死
      */
     private fun startApplyPolling() {
-        Log.d(TAG, "startApplyPolling: begin polling update_engine progress")
+        Log.d(TAG, "startApplyPolling: [POLL-V2] begin polling (no getLastResultCode, callback-driven)")
         CoroutineScope(Dispatchers.Main).launch {
             var elapsed = 0L
-            val maxPollTime = 120_000L  // 最大轮询120秒
+            val maxPollTime = 600_000L // 绝对最大轮询10分钟（回调是主路径，超时仅作兜底）
             val pollInterval = 3_000L   // 每3秒轮询一次
+            var lastProgress = -1f
+            var stalledPolls = 0
+            val maxStalledPolls = 10   // 连续30秒进度无变化即判定为卡死
+            var loopCount = 0
+            Log.d(TAG, "startApplyPolling: entering while loop, maxPollTime=$maxPollTime, pollInterval=$pollInterval")
 
             while (elapsed < maxPollTime) {
+                loopCount++
+                Log.d(TAG, "startApplyPolling: [LOOP #$loopCount] before delay, elapsed=$elapsed")
                 delay(pollInterval)
                 elapsed += pollInterval
+                Log.d(TAG, "startApplyPolling: [LOOP #$loopCount] after delay, elapsed=$elapsed")
 
                 // 如果已经通过回调切换了状态，停止轮询
                 if (stage != Stage.APPLYING) {
@@ -401,33 +434,28 @@ class MainActivity : ComponentActivity() {
                     return@launch
                 }
 
-                // 轮询进度
+                // 轮询进度（仅用于 UI 刷新；真正的完成/失败由 Binder 回调 onPayloadApplicationComplete 负责）
                 val progress = UpdateEngineWrapper.getProgress()
                 if (progress >= 0f) {
                     applyProgress = progress.coerceIn(0f, 1f)
                     Log.d(TAG, "startApplyPolling: polled progress=$progress")
+                    if (progress != lastProgress) {
+                        stalledPolls = 0
+                        lastProgress = progress
+                    } else {
+                        stalledPolls++
+                        Log.d(TAG, "startApplyPolling: progress stalled, stalledPolls=$stalledPolls/$maxStalledPolls")
+                    }
                 }
 
-                // 轮询结果码
-                val resultCode = UpdateEngineWrapper.getLastResultCode()
-                if (resultCode >= 0) {
-                    Log.d(TAG, "startApplyPolling: got resultCode=$resultCode")
-                    if (resultCode == 0) {
-                        UpdateEngineWrapper.setShouldSwitchSlotOnReboot(pendingPayloadPath)
-                        PrefsManager.setPendingSlotVersion(pendingVersionForSlot)
-                        Log.d(TAG, "stage -> REBOOT_PENDING (poll resultCode=0)")
-                        stage = Stage.REBOOT_PENDING
-                        showRebootDialogFlag = true
-                    } else {
-                        Log.w(TAG, "stage -> ERROR (poll resultCode=$resultCode)")
-                        stage = Stage.ERROR
-                        errorMessage = "升级失败，错误码: $resultCode"
-                    }
-                    ZipPayloadExtractor.cleanup(this@MainActivity)
-                    return@launch
+                // 进度连续停滞超过阈值 → 判定为卡死，结束轮询
+                if (stalledPolls >= maxStalledPolls) {
+                    Log.w(TAG, "startApplyPolling: progress stalled for ${stalledPolls * pollInterval / 1000}s, breaking loop")
+                    break
                 }
             }
 
+            Log.d(TAG, "startApplyPolling: EXITED while loop, elapsed=$elapsed, stage=$stage")
             // 超时仍未完成，默认显示重启提示
             if (stage == Stage.APPLYING) {
                 Log.w(TAG, "startApplyPolling: timeout, assuming update completed")

@@ -65,6 +65,10 @@ object UpdateEngineWrapper {
      * 回调通过自定义 Binder + IUpdateEngineCallback.Stub.asInterface() 实现，确保 Binder IPC 兼容。
      */
     fun bind(callback: UpdateEngineCallbackAdapter): Boolean {
+        val tStart = System.currentTimeMillis()
+        // 🔑 部署指纹：部署后检查 logcat 中是否有此行即可确认新代码已生效
+        Log.d(TAG, "══════ [DEPLOY-VERIFY] bind() v2.5 (step2.5 resetStatus+before bind, guard fixed) ══════")
+        Log.d(TAG, ">>> [SEQ] bind() ENTER  thread=${Thread.currentThread().name}  ts=$tStart")
         this.callback = callback
 
         // --- 步骤1：获取 update_engine 服务 ---
@@ -78,6 +82,7 @@ object UpdateEngineWrapper {
             Log.e(TAG, "bind: [step1] update_engine service not found, running diagnose...")
             diagnose()
             this.callback = null
+            Log.d(TAG, "<<< [SEQ] bind() EXIT (step1 fail)  elapsed=${System.currentTimeMillis() - tStart}ms")
             return false
         }
         Log.d(TAG, "bind: [step1] got update_engine service: $service")
@@ -93,9 +98,19 @@ object UpdateEngineWrapper {
             engine = null
             engineClass = null
             this.callback = null
+            Log.d(TAG, "<<< [SEQ] bind() EXIT (step2 fail)  elapsed=${System.currentTimeMillis() - tStart}ms")
             return false
         }
         Log.d(TAG, "bind: [step2] IUpdateEngine.Stub.asInterface success: $engine")
+
+        // --- 步骤2.5：重置引擎状态，防止残留 UPDATED_NEED_REBOOT 在回调注册时立即投递 ---
+        try {
+            val resetMethod = engineClass!!.getMethod("resetStatus")
+            resetMethod.invoke(engine)
+            Log.d(TAG, "bind: [step2.5] resetStatus() called on engine — cleared any stale completion state")
+        } catch (e: Exception) {
+            Log.w(TAG, "bind: [step2.5] resetStatus() failed (non-fatal): ${e.message}")
+        }
 
         // --- 步骤3：创建 Binder 回调 + asInterface 包装 ---
         val cbWrapper: Any
@@ -118,15 +133,17 @@ object UpdateEngineWrapper {
                                 data.enforceInterface(descriptor)
                                 val status = data.readInt()
                                 val percentage = data.readFloat()
+                                Log.d(TAG, "[SEQ] onTransact(onStatusUpdate) BEGIN  status=$status, percentage=$percentage  thread=${Thread.currentThread().name}")
                                 callback.onStatusUpdate(status, percentage)
-                                Log.d(TAG, "onStatusUpdate: status=$status, percentage=$percentage")
+                                Log.d(TAG, "[SEQ] onTransact(onStatusUpdate) END    status=$status  thread=${Thread.currentThread().name}")
                                 return true
                             }
                             transOnPayloadComplete -> {
                                 data.enforceInterface(descriptor)
                                 val errorCode = data.readInt()
+                                Log.d(TAG, "[SEQ] onTransact(onPayloadComplete) BEGIN  errorCode=$errorCode  thread=${Thread.currentThread().name}")
                                 callback.onPayloadApplicationComplete(errorCode)
-                                Log.d(TAG, "onPayloadApplicationComplete: errorCode=$errorCode")
+                                Log.d(TAG, "[SEQ] onTransact(onPayloadComplete) END    errorCode=$errorCode  thread=${Thread.currentThread().name}")
                                 return true
                             }
                         }
@@ -147,15 +164,18 @@ object UpdateEngineWrapper {
             engineClass = null
             engineCallbackStubClass = null
             this.callback = null
+            Log.d(TAG, "<<< [SEQ] bind() EXIT (step3 fail)  elapsed=${System.currentTimeMillis() - tStart}ms")
             return false
         }
 
-        // --- 步骤4：engine.bind(callback) ---
+        // --- 步骤4：engine.bind(callback) ⚠️ 关键点：此时引擎可能立即投递残留回调 ---
+        Log.d(TAG, "[SEQ] bind() step4 >>> engine.bind(cbWrapper) CALLING  thread=${Thread.currentThread().name}  ts=${System.currentTimeMillis()}")
         return try {
             val callbackIface = Class.forName("android.os.IUpdateEngineCallback")
             val bindMethod = engineClass!!.getMethod("bind", callbackIface)
             val result = bindMethod.invoke(engine, cbWrapper) as Boolean
-            Log.d(TAG, "bind: [step4] engine.bind returned $result")
+            Log.d(TAG, "[SEQ] bind() step4 <<< engine.bind(cbWrapper) RETURNED result=$result  thread=${Thread.currentThread().name}  elapsed=${System.currentTimeMillis() - tStart}ms")
+            Log.d(TAG, "<<< [SEQ] bind() EXIT  result=$result  totalElapsed=${System.currentTimeMillis() - tStart}ms")
             result
         } catch (e: Exception) {
             Log.e(TAG, "bind: [step4] engine.bind invocation failed: ${e.message}", e)
@@ -163,6 +183,7 @@ object UpdateEngineWrapper {
             engineClass = null
             engineCallbackStubClass = null
             this.callback = null
+            Log.d(TAG, "<<< [SEQ] bind() EXIT (step4 fail)  elapsed=${System.currentTimeMillis() - tStart}ms")
             false
         }
     }
@@ -188,13 +209,16 @@ object UpdateEngineWrapper {
 
     /** 发起 payload 升级 */
     fun applyPayload(fileUri: String, offset: Long, size: Long, headers: Array<String>) {
+        Log.d(TAG, ">>> [SEQ] applyPayload() ENTER  fileUri=$fileUri  thread=${Thread.currentThread().name}")
         val eng = engine ?: run {
             Log.e(TAG, "applyPayload: UpdateEngine not initialized")
             callback?.onPayloadApplicationComplete(1)
+            Log.d(TAG, "<<< [SEQ] applyPayload() EXIT (engine null)")
             return
         }
         val cls = engineClass ?: run {
             callback?.onPayloadApplicationComplete(1)
+            Log.d(TAG, "<<< [SEQ] applyPayload() EXIT (engineClass null)")
             return
         }
         Log.d(TAG, "applyPayload: fileUri=$fileUri, offset=$offset, size=$size")
@@ -206,10 +230,13 @@ object UpdateEngineWrapper {
                 Long::class.javaPrimitiveType,
                 Array<String>::class.java
             )
+            Log.d(TAG, "[SEQ] applyPayload() calling engine.applyPayload()...")
             method.invoke(eng, fileUri, offset, size, headers)
-            Log.d(TAG, "applyPayload: called successfully via AIDL")
+            Log.d(TAG, "[SEQ] applyPayload() engine.applyPayload() returned")
+            Log.d(TAG, "<<< [SEQ] applyPayload() EXIT  called successfully via AIDL")
         } catch (e: Exception) {
             Log.e(TAG, "applyPayload: failed: ${e.message}")
+            Log.d(TAG, "<<< [SEQ] applyPayload() EXIT (exception)")
             callback?.onPayloadApplicationComplete(1)
         }
     }
@@ -230,17 +257,24 @@ object UpdateEngineWrapper {
 
     /** 重置 update_engine 状态 */
     fun resetStatus() {
+        val tStart = System.currentTimeMillis()
+        Log.d(TAG, ">>> [SEQ] resetStatus() ENTER  thread=${Thread.currentThread().name}")
         try {
-            val service = getUpdateEngineService() ?: return
+            val service = getUpdateEngineService() ?: run {
+                Log.w(TAG, "<<< [SEQ] resetStatus() EXIT (service not found)")
+                return
+            }
             val cls = Class.forName("android.os.IUpdateEngine")
             val stubClass = Class.forName("android.os.IUpdateEngine\$Stub")
             val asInterface = stubClass.getMethod("asInterface", IBinder::class.java)
             val tempEngine = asInterface.invoke(null, service)
             val method = cls.getMethod("resetStatus")
+            Log.d(TAG, "[SEQ] resetStatus() calling engine.resetStatus()...")
             method.invoke(tempEngine)
-            Log.d(TAG, "resetStatus: done")
+            Log.d(TAG, "[SEQ] resetStatus() engine.resetStatus() returned")
+            Log.d(TAG, "<<< [SEQ] resetStatus() EXIT  done  elapsed=${System.currentTimeMillis() - tStart}ms")
         } catch (e: Exception) {
-            Log.e(TAG, "resetStatus: failed: ${e.message}")
+            Log.e(TAG, "<<< [SEQ] resetStatus() EXIT  failed: ${e.message}  elapsed=${System.currentTimeMillis() - tStart}ms")
         }
     }
 
@@ -254,6 +288,10 @@ object UpdateEngineWrapper {
      * @param metadataFilename 首选路径（通常是 payload 所在文件路径）
      */
     fun setShouldSwitchSlotOnReboot(metadataFilename: String): Boolean {
+        // 🔍 调用来源追踪：打印堆栈，确认是从哪个调用路径触发的
+        val callerStack = Thread.currentThread().stackTrace
+            .drop(1).take(5).joinToString(" ← ") { "${it.className}.${it.methodName}:${it.lineNumber}" }
+        Log.d(TAG, "[CALLER-TRACE] setShouldSwitchSlotOnReboot invoked from: $callerStack")
         if (switchSlotCalled) {
             Log.d(TAG, "setShouldSwitchSlotOnReboot: already called in this session, skipping")
             return true
@@ -428,14 +466,16 @@ object UpdateEngineWrapper {
             val output = proc.inputStream.bufferedReader().readText()
             val errOut = proc.errorStream.bufferedReader().readText()
 
-            if (output.contains("SWITCH_SLOT_ON_REBOOT") || output.contains("CURRENT_STATE")) {
-                val switchFlag = Regex("SWITCH_SLOT_ON_REBOOT[=\\s:]+(\\w+)", RegexOption.IGNORE_CASE).find(output)
+            // 某些 Rockchip 设备将错误输出到 stdout 而非 stderr
+            val combined = output + errOut
+            if (combined.contains("SWITCH_SLOT_ON_REBOOT") || combined.contains("CURRENT_STATE")) {
+                val switchFlag = Regex("SWITCH_SLOT_ON_REBOOT[=\\s:]+(\\w+)", RegexOption.IGNORE_CASE).find(combined)
                 if (switchFlag != null) {
                     Log.d(TAG, "verifySwitchSlotFlag: SWITCH_SLOT_ON_REBOOT = ${switchFlag.groupValues[1]}")
                 } else {
                     Log.w(TAG, "verifySwitchSlotFlag: SWITCH_SLOT_ON_REBOOT not found in output")
                 }
-            } else if (errOut.isNotEmpty() && errOut.contains("unknown command")) {
+            } else if (combined.contains("unknown command", ignoreCase = true)) {
                 // Rockchip 不支持 --status，改用 bootctl 验证
                 Log.d(TAG, "verifySwitchSlotFlag: --status not supported, falling back to bootctl verification")
                 try {
@@ -468,7 +508,9 @@ object UpdateEngineWrapper {
             val proc = rt.exec(arrayOf("update_engine_client", "--status"))
             proc.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)
             val output = proc.inputStream.bufferedReader().readText()
-            if (Regex("CURRENT_STATE[=: ]\\s*UPDATED_NEED_REBOOT").containsMatchIn(output)) {
+            val errOut = proc.errorStream.bufferedReader().readText()
+            val combined = output + errOut
+            if (Regex("CURRENT_STATE[=: ]\\s*UPDATED_NEED_REBOOT").containsMatchIn(combined)) {
                 Log.d(TAG, "checkPendingUpdate: UPDATED_NEED_REBOOT detected via command")
                 return true
             }
@@ -476,6 +518,30 @@ object UpdateEngineWrapper {
         }
 
         return false
+    }
+
+    /** 通过 AIDL 获取当前 update_engine 状态码，失败返回 -1 */
+    fun getStatus(): Int {
+        try {
+            val eng = engine
+            val cls = engineClass
+            if (eng != null && cls != null) {
+                try {
+                    val method = cls.getMethod("getStatus")
+                    val value = method.invoke(eng) as Int
+                    return value
+                } catch (_: NoSuchMethodException) {
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return -1
+    }
+
+    /** 判断引擎当前是否处于终态（升级已结束：成功或失败） */
+    fun isInTerminalState(): Boolean {
+        val status = getStatus()
+        return status >= 0 && isTerminal(status)
     }
 
     fun getProgress(): Float {
@@ -500,7 +566,9 @@ object UpdateEngineWrapper {
                     val proc = rt.exec(arrayOf("update_engine_client", arg))
                     proc.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)
                     val output = proc.inputStream.bufferedReader().readText()
-                    val progressMatch = Regex("(?:PROGRESS|progress)[=: ]\\s*([\\d.]+)").find(output)
+                    val errOut = proc.errorStream.bufferedReader().readText()
+                    val combined = output + errOut
+                    val progressMatch = Regex("(?:PROGRESS|progress)[=: ]\\s*([\\d.]+)").find(combined)
                     if (progressMatch != null) {
                         val value = progressMatch.groupValues[1].toFloatOrNull() ?: -1f
                         if (value >= 0f) return value
@@ -514,6 +582,11 @@ object UpdateEngineWrapper {
     }
 
     fun getLastResultCode(): Int {
+        // 先通过 AIDL 获取当前状态，仅在终态时才信任 getResult 返回值
+        // 防止引擎仍在 FINALIZING 时，getResult(0) 返回上一次更新的陈旧结果码
+        val status = getStatus()
+        val inTerminal = status >= 0 && isTerminal(status)
+
         try {
             val eng = engine
             val cls = engineClass
@@ -521,7 +594,12 @@ object UpdateEngineWrapper {
                 try {
                     val method = cls.getMethod("getResult", Int::class.javaPrimitiveType)
                     val value = method.invoke(eng, 0) as Int
-                    return value
+                    // 仅在引擎处于终态时返回结果，否则说明升级仍在进行中
+                    if (inTerminal) {
+                        return value
+                    } else {
+                        Log.d(TAG, "getLastResultCode: AIDL getResult returned $value but engine status=$status (not terminal), ignoring")
+                    }
                 } catch (_: NoSuchMethodException) {
                 }
             }
@@ -533,11 +611,13 @@ object UpdateEngineWrapper {
             val proc = rt.exec(arrayOf("update_engine_client", "--status"))
             proc.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)
             val output = proc.inputStream.bufferedReader().readText()
-            val exitCode = Regex("LAST_ATTEMPT_ERROR[=: ]\\s*(\\d+)").find(output)
+            val errOut = proc.errorStream.bufferedReader().readText()
+            val combined = output + errOut
+            val exitCode = Regex("LAST_ATTEMPT_ERROR[=: ]\\s*(\\d+)").find(combined)
             if (exitCode != null) {
                 return exitCode.groupValues[1].toIntOrNull() ?: -1
             }
-            if (Regex("CURRENT_STATE[=: ]\\s*UPDATED_NEED_REBOOT").containsMatchIn(output)) {
+            if (Regex("CURRENT_STATE[=: ]\\s*UPDATED_NEED_REBOOT").containsMatchIn(combined)) {
                 return 0
             }
         } catch (_: Exception) {
@@ -841,17 +921,18 @@ object UpdateEngineWrapper {
             val output = proc.inputStream.bufferedReader().readText()
             val errOut = proc.errorStream.bufferedReader().readText()
 
-            if (output.contains("CURRENT_STATE") || output.contains("PROGRESS")) {
-                Log.d(TAG, "diag: update_engine_client --status OK, output=${output.take(500)}")
-                val currentState = Regex("CURRENT_STATE[=\\s:]+(\\w+)", RegexOption.IGNORE_CASE).find(output)
+            val diagCombined = output + errOut
+            if (diagCombined.contains("CURRENT_STATE") || diagCombined.contains("PROGRESS")) {
+                Log.d(TAG, "diag: update_engine_client --status OK, output=${diagCombined.take(500)}")
+                val currentState = Regex("CURRENT_STATE[=\\s:]+(\\w+)", RegexOption.IGNORE_CASE).find(diagCombined)
                 if (currentState != null) Log.d(TAG, "diag:   CURRENT_STATE = ${currentState.groupValues[1]}")
-                val switchFlag = Regex("SWITCH_SLOT_ON_REBOOT[=\\s:]+(\\w+)", RegexOption.IGNORE_CASE).find(output)
+                val switchFlag = Regex("SWITCH_SLOT_ON_REBOOT[=\\s:]+(\\w+)", RegexOption.IGNORE_CASE).find(diagCombined)
                 if (switchFlag != null) Log.d(TAG, "diag:   SWITCH_SLOT_ON_REBOOT = ${switchFlag.groupValues[1]}")
                 else Log.w(TAG, "diag:   SWITCH_SLOT_ON_REBOOT NOT SET")
-                val progress = Regex("PROGRESS[=\\s:]+([\\d.]+)").find(output)
+                val progress = Regex("PROGRESS[=\\s:]+([\\d.]+)").find(diagCombined)
                 if (progress != null) Log.d(TAG, "diag:   PROGRESS = ${progress.groupValues[1]}")
-            } else if (errOut.isNotEmpty()) {
-                Log.w(TAG, "diag: update_engine_client --status failed: ${errOut.take(500)}")
+            } else if (diagCombined.isNotEmpty()) {
+                Log.w(TAG, "diag: update_engine_client --status failed: ${diagCombined.take(500)}")
             }
         } catch (e: Exception) {
             Log.w(TAG, "diag: update_engine_client --status exception: ${e.message}")
