@@ -26,7 +26,9 @@ object PrefsManager {
 
     fun setServerBaseUrl(url: String) {
         if (::prefs.isInitialized) {
-            prefs.edit().putString(KEY_SERVER_BASE_URL, url).apply()
+            // 统一去除末尾斜杠，避免拼接 URL 时出现双斜杠
+            val normalizedUrl = url.trimEnd('/')
+            prefs.edit().putString(KEY_SERVER_BASE_URL, normalizedUrl).apply()
         }
     }
 

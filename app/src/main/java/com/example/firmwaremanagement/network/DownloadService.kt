@@ -35,7 +35,6 @@ class DownloadService : Service() {
         private const val CHANNEL_ID = "download_channel"
         private const val NOTIFICATION_ID = 1
         private const val PROGRESS_SAVE_THRESHOLD = 1024 * 1024L // 1MB
-        private const val NO_DATA_TIMEOUT_MS = 30000L // 30秒无数据超时
 
         const val ACTION_START_DOWNLOAD = "com.example.firmwaremanagement.ACTION_START_DOWNLOAD"
         const val ACTION_PAUSE_DOWNLOAD = "com.example.firmwaremanagement.ACTION_PAUSE_DOWNLOAD"
@@ -47,9 +46,12 @@ class DownloadService : Service() {
         const val EXTRA_EXPECTED_MD5 = "extra_expected_md5"
 
         // 广播 Action
+        const val ACTION_DOWNLOAD_PROGRESS = "com.example.firmwaremanagement.ACTION_DOWNLOAD_PROGRESS"
         const val ACTION_DOWNLOAD_ERROR = "com.example.firmwaremanagement.ACTION_DOWNLOAD_ERROR"
         const val ACTION_DOWNLOAD_COMPLETE = "com.example.firmwaremanagement.ACTION_DOWNLOAD_COMPLETE"
         const val EXTRA_ERROR_MESSAGE = "extra_error_message"
+        const val EXTRA_PROGRESS_BYTES = "extra_progress_bytes"
+        const val EXTRA_TOTAL_BYTES = "extra_total_bytes"
     }
 
     inner class DownloadBinder : Binder() {
@@ -113,6 +115,7 @@ class DownloadService : Service() {
 
     fun startDownload(url: String, targetPath: String, expectedMD5: String) {
         Log.d(TAG, "startDownload: url=$url, targetPath=$targetPath, expectedMD5=$expectedMD5")
+        Log.d(TAG, "startDownload: APP UID=${android.os.Process.myUid()}, PID=${android.os.Process.myPid()}")
         if (isDownloading.get()) {
             Log.w(TAG, "startDownload: already downloading, ignoring")
             return
@@ -129,6 +132,21 @@ class DownloadService : Service() {
 
         val file = File(targetPath)
         this.tempFile = File(targetPath + ".tmp")
+
+        // 诊断：检查目标目录权限
+        val parentDir = file.parentFile
+        if (parentDir != null) {
+            Log.d(TAG, "startDownload: parentDir=${parentDir.absolutePath}, exists=${parentDir.exists()}, canWrite=${parentDir.canWrite()}")
+            if (parentDir.exists()) {
+                try {
+                    parentDir.listFiles()?.forEach { f ->
+                        Log.d(TAG, "startDownload:   ${f.name} (${if (f.isDirectory) "dir" else "file"})")
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "startDownload: cannot list parent dir: ${e.message}")
+                }
+            }
+        }
         tempFile?.parentFile?.mkdirs()
         Log.d(TAG, "startDownload: tempFile=${tempFile?.absolutePath}")
 
@@ -254,14 +272,6 @@ class DownloadService : Service() {
             Log.d(TAG, "executeDownload: starting to read data, tempFile=${tempFile?.absolutePath}")
             FileOutputStream(tempFile, isResume).use { outputStream ->
                 while (true) {
-                    // 检查无数据超时
-                    val now = System.currentTimeMillis()
-                    if (hasStartedReceivingData && now - lastDataReceivedTime > NO_DATA_TIMEOUT_MS) {
-                        Log.e(TAG, "executeDownload: timeout, no data for ${NO_DATA_TIMEOUT_MS / 1000}s, lastDataReceivedTime=$lastDataReceivedTime")
-                        onDownloadError("Download timeout: no data received for ${NO_DATA_TIMEOUT_MS / 1000} seconds")
-                        return
-                    }
-
                     // 检查是否被取消或暂停
                     if (isCancelled.get()) {
                         Log.d(TAG, "executeDownload: cancelled")
@@ -277,20 +287,7 @@ class DownloadService : Service() {
                         return
                     }
 
-                    // 非阻塞式读取数据，带超时检测
-                    val available = try {
-                        inputStream!!.available()
-                    } catch (e: Exception) {
-                        Log.e(TAG, "executeDownload: available() exception: ${e.message}")
-                        0
-                    }
-
-                    if (available <= 0) {
-                        // 没有可用数据，短暂等待后继续检测
-                        Thread.sleep(100)
-                        continue
-                    }
-
+                    // 阻塞式读取 - OkHttp 的 readTimeout 会自动处理超时（当前 10 秒）
                     bytesRead = inputStream!!.read(buffer)
                     if (bytesRead == -1) {
                         // 流结束
@@ -298,12 +295,16 @@ class DownloadService : Service() {
                         break
                     }
 
-                    hasStartedReceivingData = true
+                    if (!hasStartedReceivingData) {
+                        hasStartedReceivingData = true
+                        Log.d(TAG, "executeDownload: first data chunk received, download in progress")
+                    }
                     lastDataReceivedTime = System.currentTimeMillis()
                     outputStream.write(buffer, 0, bytesRead)
                     downloadedBytes += bytesRead
                     totalReadBytes += bytesRead
 
+                    val now = System.currentTimeMillis()
                     if (downloadedBytes - lastSaveBytes >= PROGRESS_SAVE_THRESHOLD) {
                         saveTaskState(Stage.DOWNLOADING)
                         lastSaveBytes = downloadedBytes
@@ -312,6 +313,7 @@ class DownloadService : Service() {
                     if (now - lastProgressUpdate >= 500) {
                         val speed = calculateSpeed()
                         updateNotification(downloadedBytes, totalBytes, speed)
+                        sendProgressBroadcast(downloadedBytes, totalBytes)
                         lastProgressUpdate = now
                         Log.d(TAG, "executeDownload: progress $downloadedBytes / $totalBytes, speed=$speed B/s")
                     }
@@ -431,6 +433,15 @@ class DownloadService : Service() {
     private fun calculateSpeed(): Long {
         val elapsed = System.currentTimeMillis() - downloadStartTime
         return if (elapsed > 0) (downloadedBytes * 1000 / elapsed) else 0
+    }
+
+    private fun sendProgressBroadcast(downloaded: Long, total: Long) {
+        val intent = Intent(ACTION_DOWNLOAD_PROGRESS).apply {
+            putExtra(EXTRA_PROGRESS_BYTES, downloaded)
+            putExtra(EXTRA_TOTAL_BYTES, total)
+            setPackage(packageName)
+        }
+        sendBroadcast(intent)
     }
 
     private fun saveTaskState(stage: Stage) {

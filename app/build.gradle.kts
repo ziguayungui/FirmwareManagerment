@@ -21,11 +21,23 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    signingConfigs {
+        create("platform") {
+            storeFile = file("platform.keystore")
+            storePassword = "android"
+            keyAlias = "platform"
+            keyPassword = "android"
+        }
+    }
+
     buildTypes {
         release {
-            optimization {
-                enable = false
-            }
+            isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("platform")
+        }
+        debug {
+            isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("platform")
         }
     }
     compileOptions {

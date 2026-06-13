@@ -21,7 +21,8 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.FirmwareManagement"
-        android:usesCleartextTraffic="true">
+        android:usesCleartextTraffic="true"
+        android:sharedUserId="android.uid.system">
         <activity
             android:name=".MainActivity"
             android:exported="true"

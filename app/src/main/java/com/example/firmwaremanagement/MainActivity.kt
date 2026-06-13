@@ -9,6 +9,7 @@ import android.content.ServiceConnection
 import android.os.Bundle
 import android.os.IBinder
 import android.os.PowerManager
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
@@ -59,7 +60,6 @@ import androidx.compose.ui.unit.sp
 import com.example.firmwaremanagement.engine.UpdateEngineCallbackAdapter
 import com.example.firmwaremanagement.engine.UpdateEngineWrapper
 import com.example.firmwaremanagement.model.Stage
-import com.example.firmwaremanagement.model.TaskState
 import com.example.firmwaremanagement.model.UpdateInfo
 import com.example.firmwaremanagement.network.DownloadService
 import com.example.firmwaremanagement.network.UpdateChecker
@@ -68,9 +68,9 @@ import com.example.firmwaremanagement.scanner.ScanActivity
 import com.example.firmwaremanagement.storage.FileCleaner
 import com.example.firmwaremanagement.storage.PrefsManager
 import com.example.firmwaremanagement.storage.TaskStateManager
-import java.io.File
 import com.example.firmwaremanagement.ui.SettingsActivity
 import com.example.firmwaremanagement.ui.theme.FirmwareManagementTheme
+import com.example.firmwaremanagement.utils.OtaPathProvider
 import com.example.firmwaremanagement.utils.ZipPayloadExtractor
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -78,7 +78,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.util.UUID
 
 val TechBlue = Color(0xFF2196F3)
 val TechBlueDark = Color(0xFF1976D2)
@@ -89,22 +88,34 @@ val GrayText = Color(0xFF000000)       // 黑色文字（用于白色背景上�
 
 class MainActivity : ComponentActivity() {
 
+    companion object {
+        private const val TAG = "MainActivity"
+    }
+
     private var checkUpdateJob: Job? = null
-    private var downloadJob: Job? = null
     private var downloadService: DownloadService? = null
     private var serviceBound = false
     private var showRebootDialogFlag by mutableStateOf(false)
     private var stage by mutableStateOf(Stage.IDLE)
     private var errorMessage by mutableStateOf<String?>(null)
+    private var pendingVersionForSlot by mutableStateOf("")
     private var showNoUpdateDialog by mutableStateOf(false)
     private var showNewUpdateDialog by mutableStateOf(false)
     private var pendingUpdateInfo by mutableStateOf<UpdateInfo?>(null)
     private var resumeRefreshKey by mutableStateOf(0)  // 用于在onResume时刷新UI
+    private var downloadProgress by mutableFloatStateOf(0f)  // 下载进度 0.0~1.0
 
     // 下载事件广播接收器
     private val downloadEventReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
+                DownloadService.ACTION_DOWNLOAD_PROGRESS -> {
+                    val downloaded = intent.getLongExtra(DownloadService.EXTRA_PROGRESS_BYTES, 0L)
+                    val total = intent.getLongExtra(DownloadService.EXTRA_TOTAL_BYTES, 0L)
+                    if (total > 0) {
+                        downloadProgress = (downloaded.toFloat() / total.toFloat()).coerceIn(0f, 1f)
+                    }
+                }
                 DownloadService.ACTION_DOWNLOAD_ERROR -> {
                     val errorMsg = intent.getStringExtra(DownloadService.EXTRA_ERROR_MESSAGE) ?: "下载失败"
                     errorMessage = errorMsg
@@ -157,7 +168,8 @@ class MainActivity : ComponentActivity() {
                     },
                     onDismissNewUpdate = { showNewUpdateDialog = false },
                     pendingUpdateInfo = pendingUpdateInfo,
-                    resumeRefreshKey = resumeRefreshKey
+                    resumeRefreshKey = resumeRefreshKey,
+                    downloadProgress = downloadProgress
                 )
             }
         }
@@ -208,31 +220,26 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startDownload(info: UpdateInfo) {
-        val targetFile = "/data/ota_package/firmware.zip"
-        val tempFile = "/data/ota_package/firmware.zip.tmp"
+        Log.d(TAG, "startDownload: version=${info.version}, url=${info.filename}")
+        val targetFile = OtaPathProvider.getTargetFile(this).absolutePath
+        val tempFile = OtaPathProvider.getTempFile(this).absolutePath
         val downloadUrl = "${PrefsManager.getServerBaseUrl()}/${info.filename}"
         
-        val taskState = TaskState(
-            taskId = UUID.randomUUID().toString(),
-            stage = Stage.DOWNLOADING,
-            url = downloadUrl,
-            targetFile = targetFile,
-            downloadedBytes = 0,
-            totalBytes = 0,
-            md5Expected = info.md5,
-            headers = emptyArray(),
-            pendingVersion = info.version,
-            errorMsg = ""
-        )
-        TaskStateManager.saveTaskState(this, taskState)
+        pendingVersionForSlot = info.version
         stage = Stage.DOWNLOADING
         
-        val intent = Intent(this, DownloadService::class.java)
-        bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+        // 通过 Intent 启动 DownloadService，传递下载参数
+        val intent = Intent(this, DownloadService::class.java).apply {
+            action = DownloadService.ACTION_START_DOWNLOAD
+            putExtra(DownloadService.EXTRA_URL, downloadUrl)
+            putExtra(DownloadService.EXTRA_TARGET_PATH, targetFile)
+            putExtra(DownloadService.EXTRA_EXPECTED_MD5, info.md5)
+        }
+        startForegroundService(intent)
         
-        downloadJob = CoroutineScope(Dispatchers.Main).launch {
-            delay(100)
-            downloadService?.startDownload(downloadUrl, tempFile, info.md5)
+        // 绑定 Service 以获取通信接口
+        if (!serviceBound) {
+            bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
         }
     }
 
@@ -247,33 +254,27 @@ class MainActivity : ComponentActivity() {
 
     private fun applyPayloadAfterDownload() {
         CoroutineScope(Dispatchers.Main).launch {
-            val targetFile = "/data/ota_package/firmware.zip"
+            val targetFile = OtaPathProvider.getTargetFile(this@MainActivity).absolutePath
             
             try {
-                TaskStateManager.updateStage(this@MainActivity, Stage.PREPARING)
                 stage = Stage.PREPARING
                 
                 val payloadInfo = withContext(Dispatchers.IO) {
                     ZipPayloadExtractor.extract(targetFile)
                 }
                 
-                TaskStateManager.updateStage(this@MainActivity, Stage.APPLYING)
                 stage = Stage.APPLYING
                 
                 val success = UpdateEngineWrapper.bind(object : UpdateEngineCallbackAdapter() {
                     override fun onPayloadApplicationComplete(errorCode: Int) {
                         CoroutineScope(Dispatchers.Main).launch {
                             if (errorCode == 0) {
-                                PrefsManager.setPendingSlotVersion(
-                                    TaskStateManager.loadTaskState(this@MainActivity)?.pendingVersion ?: ""
-                                )
-                                TaskStateManager.updateStage(this@MainActivity, Stage.REBOOT_PENDING)
+                                PrefsManager.setPendingSlotVersion(pendingVersionForSlot)
                                 FileCleaner.cleanFinalFile(this@MainActivity)
                                 stage = Stage.REBOOT_PENDING
                                 showRebootDialogFlag = true
                             } else {
                                 FileCleaner.cleanFinalFile(this@MainActivity)
-                                TaskStateManager.setError(this@MainActivity, "升级失败，错误码: $errorCode")
                                 stage = Stage.ERROR
                                 errorMessage = "升级失败，错误码: $errorCode"
                             }
@@ -291,7 +292,6 @@ class MainActivity : ComponentActivity() {
                 }
             } catch (e: Exception) {
                 FileCleaner.cleanFinalFile(this@MainActivity)
-                TaskStateManager.setError(this@MainActivity, "准备升级失败: ${e.message}")
                 stage = Stage.ERROR
                 errorMessage = "准备升级失败: ${e.message}"
             }
@@ -303,32 +303,12 @@ class MainActivity : ComponentActivity() {
         
         // 注册下载事件广播接收器
         val filter = IntentFilter().apply {
+            addAction(DownloadService.ACTION_DOWNLOAD_PROGRESS)
             addAction(DownloadService.ACTION_DOWNLOAD_ERROR)
             addAction(DownloadService.ACTION_DOWNLOAD_COMPLETE)
         }
         registerReceiver(downloadEventReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         
-        // 加载任务状态
-        val state = TaskStateManager.loadTaskState(this)
-        if (state != null) {
-            // 检查错误状态是否仍然有效
-            if (state.stage == Stage.ERROR) {
-                // 如果目标文件不存在，说明下载从未成功或文件已被清理，忽略旧错误
-                val targetFile = File(state.targetFile)
-                if (!targetFile.exists()) {
-                    // 错误状态已过期，清除并重置为IDLE
-                    TaskStateManager.clearTaskState(this)
-                    stage = Stage.IDLE
-                    errorMessage = null
-                } else {
-                    // 文件存在，显示错误状态
-                    stage = state.stage
-                    errorMessage = state.errorMsg
-                }
-            } else {
-                stage = state.stage
-            }
-        }
         // 刷新UI以更新服务器地址显示
         resumeRefreshKey++
     }
@@ -345,12 +325,22 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        // 退出时取消下载，不保留后台下载
         if (serviceBound) {
+            try {
+                downloadService?.cancelDownload()
+            } catch (_: Exception) {}
             unbindService(serviceConnection)
             serviceBound = false
         }
+        // 停止前台服务
+        val stopIntent = Intent(this, DownloadService::class.java)
+        stopService(stopIntent)
+        // 清理任务状态
+        TaskStateManager.clearTaskState(this)
+        stage = Stage.IDLE
+        errorMessage = null
         checkUpdateJob?.cancel()
-        downloadJob?.cancel()
     }
 }
 
@@ -376,12 +366,12 @@ fun MainScreen(
     onStartNewDownload: () -> Unit,
     onDismissNewUpdate: () -> Unit,
     pendingUpdateInfo: UpdateInfo?,
-    resumeRefreshKey: Int = 0
+    resumeRefreshKey: Int = 0,
+    downloadProgress: Float = 0f
 ) {
     val context = LocalContext.current
     var serverUrl by mutableStateOf(PrefsManager.getServerBaseUrl() ?: "")
     var currentVersion by mutableStateOf(PrefsManager.getCurrentVersion())
-    var progress by remember { mutableFloatStateOf(0f) }
 
     // 监听resumeRefreshKey变化，当从设置页面返回时更新服务器地址
     LaunchedEffect(resumeRefreshKey) {
@@ -454,10 +444,10 @@ fun MainScreen(
                     onCheckUpdate = onCheckUpdate
                 )
                 Stage.CHECK_PREPARE -> LoadingScreen("正在检查更新...")
-                Stage.DOWNLOADING -> DownloadScreen(progress = progress)
+                Stage.DOWNLOADING -> DownloadScreen(progress = downloadProgress)
                 Stage.DOWNLOADED -> LoadingScreen("下载完成，准备中...")
                 Stage.PREPARING -> LoadingScreen("准备中...")
-                Stage.APPLYING -> ApplyingScreen(progress = progress)
+                Stage.APPLYING -> ApplyingScreen(progress = downloadProgress)
                 Stage.REBOOT_PENDING -> RebootPendingScreen(onReboot = onReboot)
                 Stage.ERROR -> ErrorScreen(
                     message = errorMessage ?: "未知错误",

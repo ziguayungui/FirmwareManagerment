@@ -168,7 +168,6 @@ fun SettingsScreen(onBack: () -> Unit) {
 private fun isValidUrl(url: String): Boolean {
     if (url.isEmpty()) return false
     if (!url.startsWith("http://") && !url.startsWith("https://")) return false
-    if (url.endsWith("/")) return false
     return try {
         URL(url).host.isNotEmpty()
     } catch (e: Exception) {

@@ -2,10 +2,10 @@ package com.example.firmwaremanagement.storage
 
 import android.content.Context
 import com.example.firmwaremanagement.model.Stage
+import com.example.firmwaremanagement.utils.OtaPathProvider
 import java.io.File
 
 object FileCleaner {
-    private const val OTA_PACKAGE_DIR = "/data/ota_package/"
     private const val TEMP_FILE = "firmware.zip.tmp"
     private const val FINAL_FILE = "firmware.zip"
     private const val TASK_STATE_FILE = "task_state.json"
@@ -21,28 +21,25 @@ object FileCleaner {
 
     fun cleanAll(context: Context) {
         cleanupOtaFiles(context)
-        deleteFile(getFilePath(TASK_STATE_FILE))
+        deleteFile(context, TASK_STATE_FILE)
     }
 
     fun cleanupOtaFiles(context: Context) {
-        val dir = File(OTA_PACKAGE_DIR)
+        val dir = OtaPathProvider.getBaseDir(context)
         deleteDir(dir)
+        OtaPathProvider.clearCache()
     }
 
     fun cleanTempFile(context: Context) {
-        deleteFile(getFilePath(TEMP_FILE))
+        deleteFile(context, TEMP_FILE)
     }
 
     fun cleanFinalFile(context: Context) {
-        deleteFile(getFilePath(FINAL_FILE))
+        deleteFile(context, FINAL_FILE)
     }
 
-    private fun getFilePath(fileName: String): String {
-        return OTA_PACKAGE_DIR + fileName
-    }
-
-    private fun deleteFile(path: String): Boolean {
-        val file = File(path)
+    private fun deleteFile(context: Context, fileName: String): Boolean {
+        val file = File(OtaPathProvider.getBaseDir(context), fileName)
         return if (file.exists()) {
             file.delete()
         } else {

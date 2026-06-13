@@ -6,7 +6,7 @@ object VersionUtils {
 
     private const val TAG = "VersionUtils"
     
-    private val VERSION_PATTERN = Regex("^V\\d\\.\\d\\.\\d$")
+    private val VERSION_PATTERN = Regex("^R_\\d\\.\\d\\.\\d$")
 
     fun compareVersions(version1: String, version2: String): Int {
         Log.d(TAG, "compareVersions: v1='$version1', v2='$version2'")
